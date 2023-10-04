@@ -1,0 +1,56 @@
+            {
+                nitems = sizeof(kv->value.int32);
+                fread(&kv->value.int32, 1, nitems, file);
+                offset += nitems;
+                printf("Value = %d\n", kv->value.int32);
+                printf("Current offset = %d; actual file offset = %d\n", offset, ftell(file));
+                break;
+            }
+            {
+                nitems = sizeof(kv->value.float32);
+                fread(&kv->value.float32, 1, nitems, file);
+                offset += nitems;
+                printf("Value = %d\n", kv->value.float32);
+                printf("Current offset = %d; actual file offset = %d\n", offset, ftell(file));
+                break;
+            }
+            {
+                nitems = sizeof(kv->value.uint64);
+                fread(&kv->value.uint64, 1, nitems, file);
+                offset += nitems;
+                printf("Value = %d\n", kv->value.uint64);
+                printf("Current offset = %d; actual file offset = %d\n", offset, ftell(file));
+                break;
+            }
+            {
+                nitems = sizeof(kv->value.int64);
+                fread(&kv->value.int64, 1, nitems, file);
+                offset += nitems;
+                printf("Value = %d\n", kv->value.int64);
+                printf("Current offset = %d; actual file offset = %d\n", offset, ftell(file));
+                break;
+            }
+            {
+                nitems = sizeof(kv->value.float64);
+                fread(&kv->value.float64, 1, nitems, file);
+                offset += nitems;
+                printf("Value = %d\n", kv->value.float64);
+                printf("Current offset = %d; actual file offset = %d\n", offset, ftell(file));
+                break;
+            }
+            {
+                nitems = sizeof(kv->value.bool_);
+                fread(&kv->value.bool_, 1, nitems, file);
+                offset += nitems;
+                printf("Value = %d\n", kv->value.bool_);
+                printf("Current offset = %d; actual file offset = %d\n", offset, ftell(file));
+                break;
+            }
+            {
+                nitems = sizeof(kv->value.str);
+                fread(&kv->value.str, 1, nitems, file);
+                offset += nitems;
+                printf("Value = %d\n", kv->value.str);
+                printf("Current offset = %d; actual file offset = %d\n", offset, ftell(file));
+                break;
+            }
