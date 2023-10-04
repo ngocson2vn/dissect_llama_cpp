@@ -1,0 +1,48 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug DLCPP",
+            "type": "cppdbg",
+            "request": "launch",
+            "program": "/data00/home/son.nguyen/workspace/dissect_llama_cpp/main",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "/data00/home/son.nguyen/workspace/dissect_llama_cpp",
+            "linux": {
+                "sourceFileMap": {
+                    "/proc/self/cwd": {
+                        "editorPath": "/data00/home/son.nguyen/workspace/dissect_llama_cpp",
+                        "useForBreakpoints": false
+                    }
+                }
+            },
+            "externalConsole": false,
+            "MIMode": "gdb",
+            "setupCommands": [
+                {
+                    "description": "Test",
+                    "text": "python import sys;sys.path.insert(0, '/data00/home/son.nguyen/workspace/tools/gdb_pretty_print/python'); from libstdcxx.v6.printers import register_libstdcxx_printers; register_libstdcxx_printers(None)",
+                    "ignoreFailures": false
+                },
+                {
+                    "description": "Enable pretty-printing for gdb",
+                    "text": "-enable-pretty-printing",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "Set Disassembly Flavor to Intel",
+                    "text": "-gdb-set disassembly-flavor intel",
+                    "ignoreFailures": true
+                },
+                {
+                    "description": "",
+                    "text": "directory /data00/home/son.nguyen/workspace/dissect_llama_cpp"
+                }
+            ]
+        },
+    ]
+}
