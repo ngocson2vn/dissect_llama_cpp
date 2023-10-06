@@ -15387,7 +15387,7 @@ static bool is_interactive = false;
 // Main
 // =======================================================================
 int main(int argc, char** argv) {
-#define P_INIT_BACKEND
+  // Initialize llama backend
   printf("%s: llama backend init\n", __func__);
   llama_backend_init(true);
 
@@ -15397,10 +15397,10 @@ int main(int argc, char** argv) {
     ggml_cuda_set_main_device(main_gpu);
   }
 
-#define P_LOAD_MODEL
+  // Load llama model
   model = llama_load_model(model_file_path);
 
-#define P_WARM_UP_MODEL
+  // Warm up model
   LLAMA_LOG_INFO("Warming up the model with an empty run\n");
   llama_context_params lparams = llama_context_default_params();
   lparams.n_threads = n_threads;
@@ -15429,7 +15429,7 @@ int main(int argc, char** argv) {
     llama_reset_timings(lctx);
   }
 
-#define P_GENERATE_ANSWER
+  // Process the prompt
   {
     llama_context* ctx_guidance = NULL;
     struct llama_grammar* grammar = NULL;
