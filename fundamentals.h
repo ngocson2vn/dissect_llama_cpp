@@ -2,6 +2,21 @@
 
 #include "common.h"
 
+// Precomputed gelu table for f16 (128 KB)
+extern ggml_fp16_t table_gelu_f16[];
+
+// Precomputed quick gelu table for f16 (128 KB)
+extern ggml_fp16_t table_gelu_quick_f16[];
+
+// Precomputed silu table for f16 (128 KB)
+extern ggml_fp16_t table_silu_f16[];
+
+// Precomputed exp table for f16 (128 KB)
+extern ggml_fp16_t table_exp_f16[];
+
+// Precomputed f32 table for f16 (256 KB)
+extern float table_f32_f16[];
+
 // Super-block size
 #ifdef GGML_QKK_64
 #define QK_K 64

@@ -192,29 +192,9 @@ typedef void (*ggml_log_callback)(enum ggml_log_level level, const char* text, v
 // =======================================================================
 // Data Structures
 // =======================================================================
-// ========================================
-// Global data
-// ========================================
-
-// Precomputed gelu table for f16 (128 KB)
-ggml_fp16_t table_gelu_f16[1 << 16];
-
-// Precomputed quick gelu table for f16 (128 KB)
-ggml_fp16_t table_gelu_quick_f16[1 << 16];
-
-// Precomputed silu table for f16 (128 KB)
-ggml_fp16_t table_silu_f16[1 << 16];
-
-// Precomputed exp table for f16 (128 KB)
-ggml_fp16_t table_exp_f16[1 << 16];
-
-// Precomputed f32 table for f16 (256 KB)
-float table_f32_f16[1 << 16];
-
 static const size_t kB = 1024;
 static const size_t MB = kB * kB;
 static const size_t GB = kB * kB * kB;
-// ========================================
 
 enum gguf_type {
   GGUF_TYPE_UINT8 = 0,
@@ -255,13 +235,6 @@ enum ggml_type {
   GGML_TYPE_I16,
   GGML_TYPE_I32,
   GGML_TYPE_COUNT,
-};
-
-static const char* GGUF_TYPE_NAME[GGUF_TYPE_COUNT] = {
-    [GGUF_TYPE_UINT8] = "u8",    [GGUF_TYPE_INT8] = "i8",   [GGUF_TYPE_UINT16] = "u16",  [GGUF_TYPE_INT16] = "i16",
-    [GGUF_TYPE_UINT32] = "u32",  [GGUF_TYPE_INT32] = "i32", [GGUF_TYPE_FLOAT32] = "f32", [GGUF_TYPE_BOOL] = "bool",
-    [GGUF_TYPE_STRING] = "str",  [GGUF_TYPE_ARRAY] = "arr", [GGUF_TYPE_UINT64] = "u64",  [GGUF_TYPE_INT64] = "i64",
-    [GGUF_TYPE_FLOAT64] = "f64",
 };
 
 typedef struct {
@@ -332,24 +305,6 @@ struct gguf_context {
 
   // uint8_t * padding;
   void* data;
-};
-
-// Designated Initializers
-// https://gcc.gnu.org/onlinedocs/gcc-4.1.2/gcc/Designated-Inits.html
-static const size_t GGUF_TYPE_SIZE[GGUF_TYPE_COUNT] = {
-    [GGUF_TYPE_UINT8] = sizeof(uint8_t),
-    [GGUF_TYPE_INT8] = sizeof(int8_t),
-    [GGUF_TYPE_UINT16] = sizeof(uint16_t),
-    [GGUF_TYPE_INT16] = sizeof(int16_t),
-    [GGUF_TYPE_UINT32] = sizeof(uint32_t),
-    [GGUF_TYPE_INT32] = sizeof(int32_t),
-    [GGUF_TYPE_FLOAT32] = sizeof(float),
-    [GGUF_TYPE_BOOL] = sizeof(bool),
-    [GGUF_TYPE_STRING] = sizeof(struct gguf_str),
-    [GGUF_TYPE_ARRAY] = 0,  // undefined
-    [GGUF_TYPE_UINT64] = sizeof(uint64_t),
-    [GGUF_TYPE_INT64] = sizeof(int64_t),
-    [GGUF_TYPE_FLOAT64] = sizeof(double),
 };
 
 enum llm_kv {
@@ -873,3 +828,57 @@ enum ggml_op_pool {
   GGML_OP_POOL_AVG,
   GGML_OP_POOL_COUNT,
 };
+
+// GGML_API
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+GGML_API void ggml_time_init(void);  // call this once at the beginning of the program
+GGML_API int64_t ggml_time_ms(void);
+GGML_API int64_t ggml_time_us(void);
+GGML_API int64_t ggml_cycles(void);
+GGML_API int64_t ggml_cycles_per_ms(void);
+
+GGML_API void ggml_numa_init(void);  // call once for better performance on NUMA systems
+GGML_API bool ggml_is_numa(void);    // true if init detected that system has >1 NUMA node
+
+GGML_API void ggml_print_object(const struct ggml_object* obj);
+GGML_API void ggml_print_objects(const struct ggml_context* ctx);
+
+GGML_API int64_t ggml_nelements(const struct ggml_tensor* tensor);
+GGML_API int64_t ggml_nrows(const struct ggml_tensor* tensor);
+GGML_API size_t ggml_nbytes(const struct ggml_tensor* tensor);
+GGML_API size_t
+ggml_nbytes_pad(const struct ggml_tensor* tensor);  // same as ggml_nbytes() but padded to GGML_MEM_ALIGN
+GGML_API size_t ggml_nbytes_split(const struct ggml_tensor* tensor, int nrows_split);
+
+GGML_API int ggml_blck_size(enum ggml_type type);
+GGML_API size_t ggml_type_size(enum ggml_type type);  // size in bytes for all elements in a block
+GGML_API float ggml_type_sizef(enum ggml_type type);  // ggml_type_size()/ggml_blck_size() as float
+
+GGML_API const char* ggml_type_name(enum ggml_type type);
+GGML_API const char* ggml_op_name(enum ggml_op op);
+GGML_API const char* ggml_op_symbol(enum ggml_op op);
+
+GGML_API size_t ggml_element_size(const struct ggml_tensor* tensor);
+
+GGML_API bool ggml_is_quantized(enum ggml_type type);
+
+// TODO: temporary until model loading of ggml examples is refactored
+// GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
+
+GGML_API bool ggml_is_transposed(const struct ggml_tensor* tensor);
+GGML_API bool ggml_is_contiguous(const struct ggml_tensor* tensor);
+GGML_API bool ggml_is_permuted(const struct ggml_tensor* tensor);
+
+GGML_API bool ggml_are_same_shape(const struct ggml_tensor* t0, const struct ggml_tensor* t1);
+
+// use this to compute the memory overhead of a tensor
+GGML_API size_t ggml_tensor_overhead(void);
+
+GGML_API enum ggml_unary_op ggml_get_unary_op(const struct ggml_tensor* tensor);
+
+#ifdef __cplusplus
+}
+#endif

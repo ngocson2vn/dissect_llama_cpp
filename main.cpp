@@ -23,38 +23,39 @@
 #include "common.h"
 #include "fundamentals.h"
 #include "ggml-cuda.h"
-#include "llama.h"
 
 #define __GLOBAL_VARIABLES__
 // =======================================================================
 // Global state
 // =======================================================================
+// Precomputed gelu table for f16 (128 KB)
+ggml_fp16_t table_gelu_f16[1 << 16];
+
+// Precomputed quick gelu table for f16 (128 KB)
+ggml_fp16_t table_gelu_quick_f16[1 << 16];
+
+// Precomputed silu table for f16 (128 KB)
+ggml_fp16_t table_silu_f16[1 << 16];
+
+// Precomputed exp table for f16 (128 KB)
+ggml_fp16_t table_exp_f16[1 << 16];
+
+// Precomputed f32 table for f16 (256 KB)
+float table_f32_f16[1 << 16];
+
 static struct ggml_state g_state;
 // static atomic_int g_state_barrier = 0;
-
-static std::vector<llama_token>* g_input_tokens;
-static std::ostringstream* g_output_ss;
-static std::vector<llama_token>* g_output_tokens;
-static bool is_interactive = false;
 
 // Hard-coded params
 static const char* model_file_path = "models/llama-2-13b-chat.Q4_0.gguf";
 static const char* prompt = "What is a Large Language Model?";
 static const bool use_mmap = true;
 static const bool use_mlock = false;
-static const int n_gpu_layers = 0;
+static const int n_gpu_layers = 100;
 static const size_t n_batch = 512;
 int32_t get_num_physical_cores();
 static const size_t n_threads = get_num_physical_cores();
 static const size_t n_threads_batch = n_threads;
-
-static float* tensor_split = nullptr;
-static llama_ftype ftype;
-static std::string model_arch_name;
-static int64_t n_elements = 0;
-static size_t n_bytes = 0;
-static size_t n_tensors = 0;
-static size_t n_created = 0;
 
 #define __UTILITY_FUNCTIONS__
 // =======================================================================
@@ -310,6 +311,31 @@ static bool hash_insert(void* hash_table[], void* p) {
 // =======================================================================
 // GGML functions
 // =======================================================================
+static const char* GGUF_TYPE_NAME[GGUF_TYPE_COUNT] = {
+    [GGUF_TYPE_UINT8] = "u8",    [GGUF_TYPE_INT8] = "i8",   [GGUF_TYPE_UINT16] = "u16",  [GGUF_TYPE_INT16] = "i16",
+    [GGUF_TYPE_UINT32] = "u32",  [GGUF_TYPE_INT32] = "i32", [GGUF_TYPE_FLOAT32] = "f32", [GGUF_TYPE_BOOL] = "bool",
+    [GGUF_TYPE_STRING] = "str",  [GGUF_TYPE_ARRAY] = "arr", [GGUF_TYPE_UINT64] = "u64",  [GGUF_TYPE_INT64] = "i64",
+    [GGUF_TYPE_FLOAT64] = "f64",
+};
+
+// Designated Initializers
+// https://gcc.gnu.org/onlinedocs/gcc-4.1.2/gcc/Designated-Inits.html
+static const size_t GGUF_TYPE_SIZE[GGUF_TYPE_COUNT] = {
+    [GGUF_TYPE_UINT8] = sizeof(uint8_t),
+    [GGUF_TYPE_INT8] = sizeof(int8_t),
+    [GGUF_TYPE_UINT16] = sizeof(uint16_t),
+    [GGUF_TYPE_INT16] = sizeof(int16_t),
+    [GGUF_TYPE_UINT32] = sizeof(uint32_t),
+    [GGUF_TYPE_INT32] = sizeof(int32_t),
+    [GGUF_TYPE_FLOAT32] = sizeof(float),
+    [GGUF_TYPE_BOOL] = sizeof(bool),
+    [GGUF_TYPE_STRING] = sizeof(struct gguf_str),
+    [GGUF_TYPE_ARRAY] = 0,  // undefined
+    [GGUF_TYPE_UINT64] = sizeof(uint64_t),
+    [GGUF_TYPE_INT64] = sizeof(int64_t),
+    [GGUF_TYPE_FLOAT64] = sizeof(double),
+};
+
 static bool ggml_use_cublas() { return std::getenv("GGML_USE_CUBLAS") ? true : false; }
 
 void ggml_init_type_traits() {
@@ -478,6 +504,30 @@ void ggml_init_type_traits() {
       .from_float = quantize_row_q8_K,
   };
 #endif
+}
+
+size_t ggml_nbytes_split(const struct ggml_tensor* tensor, int nrows_split) {
+  static_assert(GGML_MAX_DIMS == 4, "GGML_MAX_DIMS is not 4 - update this function");
+
+  return (nrows_split * tensor->ne[0] * ggml_type_size(tensor->type)) / ggml_blck_size(tensor->type);
+}
+
+int ggml_blck_size(enum ggml_type type) { return type_traits[type].blck_size; }
+
+size_t ggml_type_size(enum ggml_type type) { return type_traits[type].type_size; }
+
+float ggml_type_sizef(enum ggml_type type) {
+  return ((float)(type_traits[type].type_size)) / type_traits[type].blck_size;
+}
+
+const char* ggml_type_name(enum ggml_type type) { return type_traits[type].type_name; }
+
+bool ggml_is_quantized(enum ggml_type type) { return type_traits[type].is_quantized; }
+
+bool ggml_is_permuted(const struct ggml_tensor* tensor) {
+  static_assert(GGML_MAX_DIMS == 4, "GGML_MAX_DIMS is not 4 - update this function");
+
+  return tensor->nb[0] > tensor->nb[1] || tensor->nb[1] > tensor->nb[2] || tensor->nb[2] > tensor->nb[3];
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -9474,14 +9524,14 @@ static void ggml_compute_forward_cross_entropy_loss_back(const struct ggml_compu
 static void ggml_compute_forward(struct ggml_compute_params* params, struct ggml_tensor* tensor) {
   GGML_ASSERT(params);
 
-#ifdef GGML_USE_CUBLAS
-  bool skip_cpu = ggml_cuda_compute_forward(params, tensor);
-  if (skip_cpu) {
-    return;
+  if (ggml_use_cublas()) {
+    bool skip_cpu = ggml_cuda_compute_forward(params, tensor);
+    if (skip_cpu) {
+      return;
+    }
+    GGML_ASSERT(tensor->src[0] == NULL || tensor->src[0]->backend == GGML_BACKEND_CPU);
+    GGML_ASSERT(tensor->src[1] == NULL || tensor->src[1]->backend == GGML_BACKEND_CPU);
   }
-  GGML_ASSERT(tensor->src[0] == NULL || tensor->src[0]->backend == GGML_BACKEND_CPU);
-  GGML_ASSERT(tensor->src[1] == NULL || tensor->src[1]->backend == GGML_BACKEND_CPU);
-#endif  // GGML_USE_CUBLAS
 
   switch (tensor->op) {
     case GGML_OP_DUP: {
@@ -10413,6 +10463,40 @@ struct ggml_allocator* ggml_allocator_new_measure(size_t alignment) {
 // =======================================================================
 // LLaMa Model
 // =======================================================================
+#ifdef GGML_USE_CUBLAS
+#define LLAMA_MAX_DEVICES GGML_CUDA_MAX_DEVICES
+#else
+#define LLAMA_MAX_DEVICES 1
+#endif  // GGML_USE_CUBLAS
+
+#ifdef LLAMA_SHARED
+#define LLAMA_API __attribute__((visibility("default")))
+#else
+#define LLAMA_API
+#endif
+
+#ifdef __GNUC__
+#define DEPRECATED(func, hint) func __attribute__((deprecated(hint)))
+#elif defined(_MSC_VER)
+#define DEPRECATED(func, hint) __declspec(deprecated(hint)) func
+#else
+#define DEPRECATED(func, hint) func
+#endif
+
+#define LLAMA_DEFAULT_SEED 0xFFFFFFFF
+
+#define LLAMA_MAX_RNG_STATE (64 * 1024)
+
+#define LLAMA_FILE_MAGIC_GGSN 0x6767736eu  // 'ggsn'
+
+#define LLAMA_SESSION_MAGIC LLAMA_FILE_MAGIC_GGSN
+#define LLAMA_SESSION_VERSION 1
+
+#if defined(GGML_USE_CUBLAS) || defined(GGML_USE_CLBLAST) || defined(GGML_USE_METAL)
+// Defined when llama.cpp is compiled with support for offloading model layers to GPU.
+#define LLAMA_SUPPORTS_GPU_OFFLOAD
+#endif
+
 LLAMA_ATTRIBUTE_FORMAT(2, 3)
 static void llama_log_internal(ggml_log_level level, const char* format, ...);
 static void llama_log_callback_default(ggml_log_level level, const char* text, void* user_data);
@@ -10435,6 +10519,184 @@ static void llama_log_callback_default(ggml_log_level level, const char* text, v
 #define llama_host_malloc(n) malloc(n)
 #define llama_host_free(data) free(data)
 #endif
+
+typedef int32_t llama_pos;
+typedef int32_t llama_token;
+typedef int32_t llama_seq_id;
+
+enum llama_vocab_type {
+  LLAMA_VOCAB_TYPE_SPM = 0,  // SentencePiece
+  LLAMA_VOCAB_TYPE_BPE = 1,  // Byte Pair Encoding
+};
+
+enum llama_token_type {
+  LLAMA_TOKEN_TYPE_UNDEFINED = 0,
+  LLAMA_TOKEN_TYPE_NORMAL = 1,
+  LLAMA_TOKEN_TYPE_UNKNOWN = 2,
+  LLAMA_TOKEN_TYPE_CONTROL = 3,
+  LLAMA_TOKEN_TYPE_USER_DEFINED = 4,
+  LLAMA_TOKEN_TYPE_UNUSED = 5,
+  LLAMA_TOKEN_TYPE_BYTE = 6,
+};
+
+// model file types
+enum llama_ftype {
+  LLAMA_FTYPE_ALL_F32 = 0,
+  LLAMA_FTYPE_MOSTLY_F16 = 1,            // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q4_0 = 2,           // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q4_1 = 3,           // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q4_1_SOME_F16 = 4,  // tok_embeddings.weight and output.weight are F16
+  // LLAMA_FTYPE_MOSTLY_Q4_2       = 5,  // support has been removed
+  // LLAMA_FTYPE_MOSTLY_Q4_3       = 6,  // support has been removed
+  LLAMA_FTYPE_MOSTLY_Q8_0 = 7,     // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q5_0 = 8,     // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q5_1 = 9,     // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q2_K = 10,    // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q3_K_S = 11,  // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q3_K_M = 12,  // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q3_K_L = 13,  // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q4_K_S = 14,  // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q4_K_M = 15,  // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q5_K_S = 16,  // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q5_K_M = 17,  // except 1d tensors
+  LLAMA_FTYPE_MOSTLY_Q6_K = 18,    // except 1d tensors
+
+  LLAMA_FTYPE_GUESSED = 1024,  // not specified in the model file
+};
+
+typedef struct llama_token_data {
+  llama_token id;  // token id
+  float logit;     // log-odds of the token
+  float p;         // probability of the token
+} llama_token_data;
+
+typedef struct llama_token_data_array {
+  llama_token_data* data;
+  size_t size;
+  bool sorted;
+} llama_token_data_array;
+
+typedef void (*llama_progress_callback)(float progress, void* ctx);
+
+// Input data for llama_decode
+// A llama_batch object can contain input about one or many sequences
+// The provided arrays (i.e. token, embd, pos, etc.) must have size of n_tokens
+//
+// - token  : the token ids of the input (used when embd is NULL)
+// - embd   : token embeddings (i.e. float vector of size n_embd) (used when token is NULL)
+// - pos    : the positions of the respective token in the sequence
+// - seq_id : the sequence to which the respective token belongs
+// - logits : if zero, the logits for the respective token will not be output
+//
+typedef struct llama_batch {
+  int32_t n_tokens;
+
+  llama_token* token;
+  float* embd;
+  llama_pos* pos;
+  llama_seq_id* seq_id;
+  int8_t* logits;
+
+  // NOTE: helpers for smooth API transition - can be deprecated in the future
+  //       for future-proof code, use the above fields instead and ignore everything below
+  //
+  // pos[i] = all_pos_0 + i*all_pos_1
+  //
+  llama_pos all_pos_0;      // used if pos == NULL
+  llama_pos all_pos_1;      // used if pos == NULL
+  llama_seq_id all_seq_id;  // used if seq_id == NULL
+} llama_batch;
+
+struct llama_model_params {
+  int32_t n_gpu_layers;       // number of layers to store in VRAM
+  int32_t main_gpu;           // the GPU that is used for scratch and small tensors
+  const float* tensor_split;  // how to split layers across multiple GPUs (size: LLAMA_MAX_DEVICES)
+
+  // called with a progress value between 0 and 1, pass NULL to disable
+  llama_progress_callback progress_callback;
+  // context pointer passed to the progress callback
+  void* progress_callback_user_data;
+
+  // Keep the booleans together to avoid misalignment during copy-by-value.
+  bool vocab_only;  // only load the vocabulary, no weights
+  bool use_mmap;    // use mmap if possible
+  bool use_mlock;   // force system to keep model in RAM
+};
+
+struct llama_context_params {
+  uint32_t seed;             // RNG seed, -1 for random
+  uint32_t n_ctx;            // text context
+  uint32_t n_batch;          // prompt processing batch size
+  uint32_t n_threads;        // number of threads to use for generation
+  uint32_t n_threads_batch;  // number of threads to use for batch processing
+
+  // ref: https://github.com/ggerganov/llama.cpp/pull/2054
+  float rope_freq_base;   // RoPE base frequency
+  float rope_freq_scale;  // RoPE frequency scaling factor
+
+  // Keep the booleans together to avoid misalignment during copy-by-value.
+  bool mul_mat_q;   // if true, use experimental mul_mat_q kernels
+  bool f16_kv;      // use fp16 for KV cache
+  bool logits_all;  // the llama_eval() call computes all logits, not just the last one
+  bool embedding;   // embedding mode only
+};
+
+// model quantization parameters
+typedef struct llama_model_quantize_params {
+  int nthread;  // number of threads to use for quantizing, if <=0 will use std::thread::hardware_concurrency()
+  enum llama_ftype ftype;       // quantize to this llama_ftype
+  bool allow_requantize;        // allow quantizing non-f32/f16 tensors
+  bool quantize_output_tensor;  // quantize output.weight
+  bool only_copy;               // only copy tensors - ftype, allow_requantize and quantize_output_tensor are ignored
+} llama_model_quantize_params;
+
+// grammar types
+struct llama_grammar;
+
+// grammar element type
+enum llama_gretype {
+  // end of rule definition
+  LLAMA_GRETYPE_END = 0,
+
+  // start of alternate definition for rule
+  LLAMA_GRETYPE_ALT = 1,
+
+  // non-terminal element: reference to rule
+  LLAMA_GRETYPE_RULE_REF = 2,
+
+  // terminal element: character (code point)
+  LLAMA_GRETYPE_CHAR = 3,
+
+  // inverse char(s) ([^a], [^a-b] [^abc])
+  LLAMA_GRETYPE_CHAR_NOT = 4,
+
+  // modifies a preceding LLAMA_GRETYPE_CHAR or LLAMA_GRETYPE_CHAR_ALT to
+  // be an inclusive range ([a-z])
+  LLAMA_GRETYPE_CHAR_RNG_UPPER = 5,
+
+  // modifies a preceding LLAMA_GRETYPE_CHAR or
+  // LLAMA_GRETYPE_CHAR_RNG_UPPER to add an alternate char to match ([ab], [a-zA])
+  LLAMA_GRETYPE_CHAR_ALT = 6,
+};
+
+typedef struct llama_grammar_element {
+  enum llama_gretype type;
+  uint32_t value;  // Unicode code point or rule ID
+} llama_grammar_element;
+
+// performance timing information
+struct llama_timings {
+  double t_start_ms;
+  double t_end_ms;
+  double t_load_ms;
+  double t_sample_ms;
+  double t_p_eval_ms;
+  double t_eval_ms;
+
+  int32_t n_sample;
+  int32_t n_p_eval;
+  int32_t n_eval;
+};
 
 struct gpt_params {
   uint32_t seed = -1;  // RNG seed
@@ -13296,99 +13558,6 @@ void llama_sample_softmax(struct llama_context* ctx, llama_token_data_array* can
   }
 }
 
-llama_token llama_sample_token_mirostat(struct llama_context* ctx, llama_token_data_array* candidates, float tau,
-                                        float eta, int m, float* mu) {
-  GGML_ASSERT(ctx);
-
-  auto N = float(llama_n_vocab(ctx->model));
-  int64_t t_start_sample_us;
-  t_start_sample_us = ggml_time_us();
-
-  llama_sample_softmax(nullptr, candidates);
-
-  // Estimate s_hat using the most probable m tokens
-  float s_hat = 0.0;
-  float sum_ti_bi = 0.0;
-  float sum_ti_sq = 0.0;
-  for (size_t i = 0; i < size_t(m - 1) && i < candidates->size - 1; ++i) {
-    float t_i = logf(float(i + 2) / float(i + 1));
-    float b_i = logf(candidates->data[i].p / candidates->data[i + 1].p);
-    sum_ti_bi += t_i * b_i;
-    sum_ti_sq += t_i * t_i;
-  }
-  s_hat = sum_ti_bi / sum_ti_sq;
-
-  // Compute k from the estimated s_hat and target surprise value
-  float epsilon_hat = s_hat - 1;
-  float k = powf((epsilon_hat * powf(2, *mu)) / (1 - powf(N, -epsilon_hat)), 1 / s_hat);
-
-  // Sample the next word X using top-k sampling
-  llama_sample_top_k(nullptr, candidates, int(k), 1);
-  if (ctx) {
-    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-  }
-  llama_token X = llama_sample_token1(ctx, candidates);
-  t_start_sample_us = ggml_time_us();
-
-  // Compute error as the difference between observed surprise and target surprise value
-  size_t X_idx = std::distance(candidates->data,
-                               std::find_if(candidates->data, candidates->data + candidates->size,
-                                            [&](const llama_token_data& candidate) { return candidate.id == X; }));
-  float observed_surprise = -log2f(candidates->data[X_idx].p);
-  float e = observed_surprise - tau;
-
-  // Update mu using the learning rate and error
-  *mu = *mu - eta * e;
-
-  if (ctx) {
-    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-  }
-  return X;
-}
-
-llama_token llama_sample_token_mirostat_v2(struct llama_context* ctx, llama_token_data_array* candidates, float tau,
-                                           float eta, float* mu) {
-  int64_t t_start_sample_us;
-  t_start_sample_us = ggml_time_us();
-
-  llama_sample_softmax(ctx, candidates);
-
-  // Truncate the words with surprise values greater than mu
-  candidates->size = std::distance(
-      candidates->data, std::find_if(candidates->data, candidates->data + candidates->size,
-                                     [&](const llama_token_data& candidate) { return -log2f(candidate.p) > *mu; }));
-
-  if (candidates->size == 0) {
-    candidates->size = 1;
-  }
-
-  if (ctx) {
-    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-  }
-
-  // Normalize the probabilities of the remaining words
-  llama_sample_softmax(ctx, candidates);
-
-  // Sample the next word X from the remaining words
-  llama_token X = llama_sample_token1(ctx, candidates);
-  t_start_sample_us = ggml_time_us();
-
-  // Compute error as the difference between observed surprise and target surprise value
-  size_t X_idx = std::distance(candidates->data,
-                               std::find_if(candidates->data, candidates->data + candidates->size,
-                                            [&](const llama_token_data& candidate) { return candidate.id == X; }));
-  float observed_surprise = -log2f(candidates->data[X_idx].p);
-  float e = observed_surprise - tau;
-
-  // Update mu using the learning rate and error
-  *mu = *mu - eta * e;
-
-  if (ctx) {
-    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
-  }
-  return X;
-}
-
 void llama_sample_top_k(struct llama_context* ctx, llama_token_data_array* candidates, int k, size_t min_keep) {
   const int64_t t_start_sample_us = ggml_time_us();
 
@@ -13585,6 +13754,99 @@ llama_token llama_sample_token1(struct llama_context* ctx, llama_token_data_arra
   ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
   ctx->n_sample++;
   return result;
+}
+
+llama_token llama_sample_token_mirostat(struct llama_context* ctx, llama_token_data_array* candidates, float tau,
+                                        float eta, int m, float* mu) {
+  GGML_ASSERT(ctx);
+
+  auto N = float(llama_n_vocab(ctx->model));
+  int64_t t_start_sample_us;
+  t_start_sample_us = ggml_time_us();
+
+  llama_sample_softmax(nullptr, candidates);
+
+  // Estimate s_hat using the most probable m tokens
+  float s_hat = 0.0;
+  float sum_ti_bi = 0.0;
+  float sum_ti_sq = 0.0;
+  for (size_t i = 0; i < size_t(m - 1) && i < candidates->size - 1; ++i) {
+    float t_i = logf(float(i + 2) / float(i + 1));
+    float b_i = logf(candidates->data[i].p / candidates->data[i + 1].p);
+    sum_ti_bi += t_i * b_i;
+    sum_ti_sq += t_i * t_i;
+  }
+  s_hat = sum_ti_bi / sum_ti_sq;
+
+  // Compute k from the estimated s_hat and target surprise value
+  float epsilon_hat = s_hat - 1;
+  float k = powf((epsilon_hat * powf(2, *mu)) / (1 - powf(N, -epsilon_hat)), 1 / s_hat);
+
+  // Sample the next word X using top-k sampling
+  llama_sample_top_k(nullptr, candidates, int(k), 1);
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+  llama_token X = llama_sample_token1(ctx, candidates);
+  t_start_sample_us = ggml_time_us();
+
+  // Compute error as the difference between observed surprise and target surprise value
+  size_t X_idx = std::distance(candidates->data,
+                               std::find_if(candidates->data, candidates->data + candidates->size,
+                                            [&](const llama_token_data& candidate) { return candidate.id == X; }));
+  float observed_surprise = -log2f(candidates->data[X_idx].p);
+  float e = observed_surprise - tau;
+
+  // Update mu using the learning rate and error
+  *mu = *mu - eta * e;
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+  return X;
+}
+
+llama_token llama_sample_token_mirostat_v2(struct llama_context* ctx, llama_token_data_array* candidates, float tau,
+                                           float eta, float* mu) {
+  int64_t t_start_sample_us;
+  t_start_sample_us = ggml_time_us();
+
+  llama_sample_softmax(ctx, candidates);
+
+  // Truncate the words with surprise values greater than mu
+  candidates->size = std::distance(
+      candidates->data, std::find_if(candidates->data, candidates->data + candidates->size,
+                                     [&](const llama_token_data& candidate) { return -log2f(candidate.p) > *mu; }));
+
+  if (candidates->size == 0) {
+    candidates->size = 1;
+  }
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+
+  // Normalize the probabilities of the remaining words
+  llama_sample_softmax(ctx, candidates);
+
+  // Sample the next word X from the remaining words
+  llama_token X = llama_sample_token1(ctx, candidates);
+  t_start_sample_us = ggml_time_us();
+
+  // Compute error as the difference between observed surprise and target surprise value
+  size_t X_idx = std::distance(candidates->data,
+                               std::find_if(candidates->data, candidates->data + candidates->size,
+                                            [&](const llama_token_data& candidate) { return candidate.id == X; }));
+  float observed_surprise = -log2f(candidates->data[X_idx].p);
+  float e = observed_surprise - tau;
+
+  // Update mu using the learning rate and error
+  *mu = *mu - eta * e;
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+  return X;
 }
 
 llama_token llama_sample_token2(struct llama_context* lctx, struct llama_context* ctx_guidance,
@@ -13928,6 +14190,14 @@ int llama_decode(llama_context* lctx, llama_batch& batch) {
 }
 
 llama_model* llama_load_model(const char* model_file_path) {
+  static float* tensor_split = nullptr;
+  static llama_ftype ftype;
+  static std::string model_arch_name;
+  static int64_t n_elements = 0;
+  static size_t n_bytes = 0;
+  static size_t n_tensors = 0;
+  static size_t n_created = 0;
+
   struct ggml_context* ctx_meta = NULL;
 
 #define P_BUILD_GGUF_CONTEXT
@@ -14813,6 +15083,7 @@ llama_model* llama_load_model(const char* model_file_path) {
 #define __LOAD_MODEL_TENSORS
   size_t ctx_size = 0;
   size_t mmapped_size = 0;
+  model->n_gpu_layers = n_gpu_layers;
   {
     for (int i = 0; i < gguf_ctx->header.n_tensors; i++) {
       struct ggml_tensor* tensor = ggml_get_tensor(ctx_meta, gguf_ctx->infos[i].name.data);
@@ -15086,7 +15357,7 @@ llama_model* llama_load_model(const char* model_file_path) {
     // loading time will be recalculate after the first eval, so
     // we take page faults deferred by mmap() into consideration
     model->t_load_us = ggml_time_us() - model->t_start_us;
-    printf("\nOK\n\n");
+    printf("OK\n\n");
   }
 
 #define __CLEAN_UP_MEMORY
@@ -15106,6 +15377,10 @@ llama_model* llama_load_model(const char* model_file_path) {
 // Global variables
 // =======================================================================
 llama_model* model = NULL;
+static std::vector<llama_token>* g_input_tokens;
+static std::ostringstream* g_output_ss;
+static std::vector<llama_token>* g_output_tokens;
+static bool is_interactive = false;
 
 #define __MAIN_FUNCTION__
 // =======================================================================
@@ -15225,7 +15500,8 @@ int main(int argc, char** argv) {
 
           llama_batch lbatch = llama_batch_get_one(&embd[i], n_eval, n_past, 0);
           if (llama_decode(lctx, lbatch)) {
-            printf("%s : failed to eval\n", __func__);
+            printf("\n");
+            debug("%s : failed to eval\n", __func__);
             return 1;
           }
 
@@ -15238,7 +15514,7 @@ int main(int argc, char** argv) {
       embd.clear();
 
       if ((int)embd_inp.size() <= n_consumed && !is_interactive) {
-        const llama_token id = llama_sample_token2(lctx, ctx_guidance, grammar, params, last_tokens, candidates);
+        const llama_token id = llama_sample_token2(lctx, ctx_guidance, grammar, params, last_tokens, candidates, 0);
 
         last_tokens.erase(last_tokens.begin());
         last_tokens.push_back(id);
@@ -15256,7 +15532,7 @@ int main(int argc, char** argv) {
         debug("n_remain: %d\n", n_remain);
       } else {
         // some user input remains from prompt or interaction, forward it to processing
-        printf("embd_inp.size(): %d, n_consumed: %d\n", (int)embd_inp.size(), n_consumed);
+        printf("embd_inp.size(): %d, n_consumed: %d\n\n", (int)embd_inp.size(), n_consumed);
         while ((int)embd_inp.size() > n_consumed) {
           embd.push_back(embd_inp[n_consumed]);
           last_tokens.erase(last_tokens.begin());

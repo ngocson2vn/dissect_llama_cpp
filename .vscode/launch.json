@@ -10,6 +10,12 @@
             "request": "launch",
             "program": "/data00/home/son.nguyen/workspace/dissect_llama_cpp/main",
             "args": [],
+            "environment": [
+                {
+                    "name": "GGML_USE_CUBLAS",
+                    "value": "1"
+                }
+            ],
             "stopAtEntry": false,
             "cwd": "/data00/home/son.nguyen/workspace/dissect_llama_cpp",
             "linux": {
