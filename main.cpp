@@ -15,7 +15,9 @@
 #include <regex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "common.h"
@@ -30,17 +32,79 @@
 static struct ggml_state g_state;
 // static atomic_int g_state_barrier = 0;
 
+static std::vector<llama_token>* g_input_tokens;
+static std::ostringstream* g_output_ss;
+static std::vector<llama_token>* g_output_tokens;
+static bool is_interactive = false;
+
+// Hard-coded params
+static const char* model_file_path = "models/llama-2-13b-chat.Q4_0.gguf";
+static const char* prompt = "What is a Large Language Model?";
+static const bool use_mmap = true;
+static const bool use_mlock = false;
+static const int n_gpu_layers = 0;
+static const size_t n_batch = 512;
+int32_t get_num_physical_cores();
+static const size_t n_threads = get_num_physical_cores();
+static const size_t n_threads_batch = n_threads;
+
+static float* tensor_split = nullptr;
+static llama_ftype ftype;
+static std::string model_arch_name;
+static int64_t n_elements = 0;
+static size_t n_bytes = 0;
+static size_t n_tensors = 0;
+static size_t n_created = 0;
+
 #define __UTILITY_FUNCTIONS__
 // =======================================================================
 // Utility functions
 // =======================================================================
-static bool ggml_use_cublas() { return std::getenv("GGML_USE_CUBLAS") ? true : false; }
+bool ggml_is_numa(void) { return g_state.numa.n_nodes > 1; }
 
-size_t ggml_used_mem(const struct ggml_context* ctx) {
-  return ctx->objects_end == NULL ? 0 : ctx->objects_end->offs + ctx->objects_end->size;
+static bool is_debug_mode() { return std::getenv("LLM_DEBUG") ? true : false; }
+
+template <typename... Types>
+void debug(const char* format, Types... args) {
+  if (is_debug_mode()) {
+    printf(format, args...);
+  }
 }
 
-bool ggml_is_numa(void) { return g_state.numa.n_nodes > 1; }
+int32_t get_num_physical_cores() {
+#ifdef __linux__
+  // enumerate the set of thread siblings, num entries is num cores
+  std::unordered_set<std::string> siblings;
+  for (uint32_t cpu = 0; cpu < UINT32_MAX; ++cpu) {
+    std::ifstream thread_siblings("/sys/devices/system/cpu" + std::to_string(cpu) + "/topology/thread_siblings");
+    if (!thread_siblings.is_open()) {
+      break;  // no more cpus
+    }
+    std::string line;
+    if (std::getline(thread_siblings, line)) {
+      siblings.insert(line);
+    }
+  }
+  if (!siblings.empty()) {
+    return static_cast<int32_t>(siblings.size());
+  }
+#elif defined(__APPLE__) && defined(__MACH__)
+  int32_t num_physical_cores;
+  size_t len = sizeof(num_physical_cores);
+  int result = sysctlbyname("hw.perflevel0.physicalcpu", &num_physical_cores, &len, NULL, 0);
+  if (result == 0) {
+    return num_physical_cores;
+  }
+  result = sysctlbyname("hw.physicalcpu", &num_physical_cores, &len, NULL, 0);
+  if (result == 0) {
+    return num_physical_cores;
+  }
+#elif defined(_WIN32)
+  // TODO: Implement
+#endif
+  unsigned int n_threads = std::thread::hardware_concurrency();
+  return n_threads > 0 ? (n_threads <= 4 ? n_threads : n_threads / 2) : 4;
+}
 
 static void set_numa_thread_affinity(int thread_n, int n_threads) {
   if (!ggml_is_numa()) {
@@ -85,6 +149,44 @@ static void clear_numa_thread_affinity(void) {
   }
 
   CPU_FREE(cpus);
+}
+
+void process_escapes(std::string& input) {
+  std::size_t input_len = input.length();
+  std::size_t output_idx = 0;
+
+  for (std::size_t input_idx = 0; input_idx < input_len; ++input_idx) {
+    if (input[input_idx] == '\\' && input_idx + 1 < input_len) {
+      switch (input[++input_idx]) {
+        case 'n':
+          input[output_idx++] = '\n';
+          break;
+        case 'r':
+          input[output_idx++] = '\r';
+          break;
+        case 't':
+          input[output_idx++] = '\t';
+          break;
+        case '\'':
+          input[output_idx++] = '\'';
+          break;
+        case '\"':
+          input[output_idx++] = '\"';
+          break;
+        case '\\':
+          input[output_idx++] = '\\';
+          break;
+        default:
+          input[output_idx++] = '\\';
+          input[output_idx++] = input[input_idx];
+          break;
+      }
+    } else {
+      input[output_idx++] = input[input_idx];
+    }
+  }
+
+  input.resize(output_idx);
 }
 
 static size_t utf8_len(char src) {
@@ -208,6 +310,330 @@ static bool hash_insert(void* hash_table[], void* p) {
 // =======================================================================
 // GGML functions
 // =======================================================================
+static bool ggml_use_cublas() { return std::getenv("GGML_USE_CUBLAS") ? true : false; }
+
+void ggml_init_type_traits() {
+  type_traits[GGML_TYPE_I8] = (ggml_type_traits_t){
+      .type_name = "i8",
+      .blck_size = 1,
+      .type_size = sizeof(int8_t),
+      .is_quantized = false,
+  };
+  type_traits[GGML_TYPE_I16] = (ggml_type_traits_t){
+      .type_name = "i16",
+      .blck_size = 1,
+      .type_size = sizeof(int16_t),
+      .is_quantized = false,
+  };
+  type_traits[GGML_TYPE_I32] = (ggml_type_traits_t){
+      .type_name = "i32",
+      .blck_size = 1,
+      .type_size = sizeof(int32_t),
+      .is_quantized = false,
+  };
+  type_traits[GGML_TYPE_F32] = (ggml_type_traits_t){
+      .type_name = "f32",
+      .blck_size = 1,
+      .type_size = sizeof(float),
+      .is_quantized = false,
+      .vec_dot = (ggml_vec_dot_t)ggml_vec_dot_f32,
+      .vec_dot_type = GGML_TYPE_F32,
+  };
+  type_traits[GGML_TYPE_F16] = (ggml_type_traits_t){
+      .type_name = "f16",
+      .blck_size = 1,
+      .type_size = sizeof(ggml_fp16_t),
+      .is_quantized = false,
+      .to_float = (ggml_to_float_t)ggml_fp16_to_fp32_row,
+      .from_float = (ggml_from_float_t)ggml_fp32_to_fp16_row,
+      .from_float_reference = (ggml_from_float_t)ggml_fp32_to_fp16_row,
+      .vec_dot = (ggml_vec_dot_t)ggml_vec_dot_f16,
+      .vec_dot_type = GGML_TYPE_F16,
+  };
+  type_traits[GGML_TYPE_Q4_0] = (ggml_type_traits_t){
+      .type_name = "q4_0",
+      .blck_size = QK4_0,
+      .type_size = sizeof(block_q4_0),
+      .is_quantized = true,
+      .to_float = (ggml_to_float_t)dequantize_row_q4_0,
+      .from_float = quantize_row_q4_0,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q4_0_reference,
+      .vec_dot = ggml_vec_dot_q4_0_q8_0,
+      .vec_dot_type = GGML_TYPE_Q8_0,
+  };
+  type_traits[GGML_TYPE_Q4_1] = (ggml_type_traits_t){
+      .type_name = "q4_1",
+      .blck_size = QK4_1,
+      .type_size = sizeof(block_q4_1),
+      .is_quantized = true,
+      .to_float = (ggml_to_float_t)dequantize_row_q4_1,
+      .from_float = quantize_row_q4_1,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q4_1_reference,
+      .vec_dot = ggml_vec_dot_q4_1_q8_1,
+      .vec_dot_type = GGML_TYPE_Q8_1,
+  };
+  type_traits[GGML_TYPE_Q5_0] = (ggml_type_traits_t){
+      .type_name = "q5_0",
+      .blck_size = QK5_0,
+      .type_size = sizeof(block_q5_0),
+      .is_quantized = true,
+      .to_float = (ggml_to_float_t)dequantize_row_q5_0,
+      .from_float = quantize_row_q5_0,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q5_0_reference,
+      .vec_dot = ggml_vec_dot_q5_0_q8_0,
+      .vec_dot_type = GGML_TYPE_Q8_0,
+  };
+  type_traits[GGML_TYPE_Q5_1] = (ggml_type_traits_t){
+      .type_name = "q5_1",
+      .blck_size = QK5_1,
+      .type_size = sizeof(block_q5_1),
+      .is_quantized = true,
+      .to_float = (ggml_to_float_t)dequantize_row_q5_1,
+      .from_float = quantize_row_q5_1,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q5_1_reference,
+      .vec_dot = ggml_vec_dot_q5_1_q8_1,
+      .vec_dot_type = GGML_TYPE_Q8_1,
+  };
+  type_traits[GGML_TYPE_Q8_0] = (ggml_type_traits_t){
+      .type_name = "q8_0",
+      .blck_size = QK8_0,
+      .type_size = sizeof(block_q8_0),
+      .is_quantized = true,
+      .to_float = dequantize_row_q8_0,
+      .from_float = quantize_row_q8_0,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q8_0_reference,
+      .vec_dot = ggml_vec_dot_q8_0_q8_0,
+      .vec_dot_type = GGML_TYPE_Q8_0,
+  };
+  type_traits[GGML_TYPE_Q8_1] = (ggml_type_traits_t){
+      .type_name = "q8_1",
+      .blck_size = QK8_1,
+      .type_size = sizeof(block_q8_1),
+      .is_quantized = true,
+      .from_float = quantize_row_q8_1,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q8_1_reference,
+      .vec_dot_type = GGML_TYPE_Q8_1,
+  };
+#ifdef GGML_USE_K_QUANTS
+  type_traits[GGML_TYPE_Q2_K] = (ggml_type_traits_t){
+      .type_name = "q2_K",
+      .blck_size = QK_K,
+      .type_size = sizeof(block_q2_K),
+      .is_quantized = true,
+      .to_float = (ggml_to_float_t)dequantize_row_q2_K,
+      .from_float = quantize_row_q2_K,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q2_K_reference,
+      .vec_dot = ggml_vec_dot_q2_K_q8_K,
+      .vec_dot_type = GGML_TYPE_Q8_K,
+  };
+  type_traits[GGML_TYPE_Q3_K] = (ggml_type_traits_t){
+      .type_name = "q3_K",
+      .blck_size = QK_K,
+      .type_size = sizeof(block_q3_K),
+      .is_quantized = true,
+      .to_float = (ggml_to_float_t)dequantize_row_q3_K,
+      .from_float = quantize_row_q3_K,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q3_K_reference,
+      .vec_dot = ggml_vec_dot_q3_K_q8_K,
+      .vec_dot_type = GGML_TYPE_Q8_K,
+  };
+  type_traits[GGML_TYPE_Q4_K] = (ggml_type_traits_t){
+      .type_name = "q4_K",
+      .blck_size = QK_K,
+      .type_size = sizeof(block_q4_K),
+      .is_quantized = true,
+      .to_float = (ggml_to_float_t)dequantize_row_q4_K,
+      .from_float = quantize_row_q4_K,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q4_K_reference,
+      .vec_dot = ggml_vec_dot_q4_K_q8_K,
+      .vec_dot_type = GGML_TYPE_Q8_K,
+  };
+  type_traits[GGML_TYPE_Q5_K] = (ggml_type_traits_t){
+      .type_name = "q5_K",
+      .blck_size = QK_K,
+      .type_size = sizeof(block_q5_K),
+      .is_quantized = true,
+      .to_float = (ggml_to_float_t)dequantize_row_q5_K,
+      .from_float = quantize_row_q5_K,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q5_K_reference,
+      .vec_dot = ggml_vec_dot_q5_K_q8_K,
+      .vec_dot_type = GGML_TYPE_Q8_K,
+  };
+  type_traits[GGML_TYPE_Q6_K] = (ggml_type_traits_t){
+      .type_name = "q6_K",
+      .blck_size = QK_K,
+      .type_size = sizeof(block_q6_K),
+      .is_quantized = true,
+      .to_float = (ggml_to_float_t)dequantize_row_q6_K,
+      .from_float = quantize_row_q6_K,
+      .from_float_reference = (ggml_from_float_t)quantize_row_q6_K_reference,
+      .vec_dot = ggml_vec_dot_q6_K_q8_K,
+      .vec_dot_type = GGML_TYPE_Q8_K,
+  };
+  type_traits[GGML_TYPE_Q8_K] = (ggml_type_traits_t){
+      .type_name = "q8_K",
+      .blck_size = QK_K,
+      .type_size = sizeof(block_q8_K),
+      .is_quantized = true,
+      .from_float = quantize_row_q8_K,
+  };
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+int ggml_cpu_has_avx(void) {
+#if defined(__AVX__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_avx2(void) {
+#if defined(__AVX2__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_avx512(void) {
+#if defined(__AVX512F__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_avx512_vbmi(void) {
+#if defined(__AVX512VBMI__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_avx512_vnni(void) {
+#if defined(__AVX512VNNI__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_fma(void) {
+#if defined(__FMA__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_neon(void) {
+#if defined(__ARM_NEON)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_arm_fma(void) {
+#if defined(__ARM_FEATURE_FMA)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_metal(void) {
+#if defined(GGML_USE_METAL)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_f16c(void) {
+#if defined(__F16C__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_fp16_va(void) {
+#if defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_wasm_simd(void) {
+#if defined(__wasm_simd128__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_blas(void) {
+#if defined(GGML_USE_ACCELERATE) || defined(GGML_USE_OPENBLAS) || defined(GGML_USE_CUBLAS) || defined(GGML_USE_CLBLAST)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_cublas(void) {
+#if defined(GGML_USE_CUBLAS)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_clblast(void) {
+#if defined(GGML_USE_CLBLAST)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_gpublas(void) { return ggml_cpu_has_cublas() || ggml_cpu_has_clblast(); }
+
+int ggml_cpu_has_sse3(void) {
+#if defined(__SSE3__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_ssse3(void) {
+#if defined(__SSSE3__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+int ggml_cpu_has_vsx(void) {
+#if defined(__POWER9_VECTOR__)
+  return 1;
+#else
+  return 0;
+#endif
+}
+
+////////////////////////////////////////////////////////////////////////////////
+
+size_t ggml_used_mem(const struct ggml_context* ctx) {
+  return ctx->objects_end == NULL ? 0 : ctx->objects_end->offs + ctx->objects_end->size;
+}
+
 void ggml_numa_init(void) {
   if (g_state.numa.n_nodes > 0) {
     fprintf(stderr, "ggml_numa_init: NUMA already initialized\n");
@@ -371,6 +797,8 @@ struct ggml_context* ggml_init(struct ggml_init_params params) {
   if (is_first_call) {
     // initialize time system (required on Windows)
     // ggml_time_init();
+
+    ggml_init_type_traits();
 
     // initialize GELU, Quick GELU, SILU and EXP F32 tables
     {
@@ -9377,8 +9805,12 @@ static thread_ret_t ggml_graph_compute_thread(void* data) {
           // TODO: maybe push node_n to the atomic but if other threads see n_tasks is 1,
           // they do something more efficient than spinning (?)
           params.type = GGML_TASK_COMPUTE;
-          std::string node_name = node->name;
-          printf("%s: compute node: %-40s (%d/%d)\n", __func__, node_name.c_str(), node_n, cgraph->n_nodes);
+
+          if (is_debug_mode()) {
+            std::string node_name = node->name;
+            printf("%s: compute node: %-40s (%d/%d)\n", __func__, node_name.c_str(), node_n, cgraph->n_nodes);
+          }
+
           ggml_compute_forward(&params, node);
 
           if (GGML_OP_HAS_FINALIZE[node->op]) {
@@ -9568,7 +10000,7 @@ void ggml_allocator_alloc(struct ggml_allocator* allocator, struct ggml_tensor* 
   size_t size = ggml_nbytes(tensor);
   size = aligned_offset(NULL, size, allocator->alignment);
 
-  printf("%s: allocating %s (%zu bytes) - ", __func__, tensor->name, size);
+  debug("%s: allocating %s (%zu bytes) - ", __func__, tensor->name, size);
 
   size_t max_avail = 0;
 
@@ -9584,7 +10016,7 @@ void ggml_allocator_alloc(struct ggml_allocator* allocator, struct ggml_tensor* 
     }
   }
 
-  printf("block %d\n", best_fit_block);
+  debug("block %d\n", best_fit_block);
 
   if (best_fit_block == -1) {
     // the last block is our last resort
@@ -9612,7 +10044,7 @@ void ggml_allocator_alloc(struct ggml_allocator* allocator, struct ggml_tensor* 
   }
 
   tensor->data = addr;
-  printf("%s: allocated data at %p\n", __func__, tensor->data);
+  debug("%s: allocated data at %p\n", __func__, tensor->data);
 
 #ifdef GGML_ALLOCATOR_DEBUG
   add_allocated_tensor(allocator, tensor);
@@ -9630,7 +10062,7 @@ void ggml_allocator_alloc(struct ggml_allocator* allocator, struct ggml_tensor* 
 #endif
 
   allocator->max_size = MAX(allocator->max_size, (char*)addr - (char*)allocator->data + size);
-  printf("\n");
+  debug("\n");
 }
 
 // check if a tensor is allocated by this buffer
@@ -9656,7 +10088,7 @@ static void allocate_node(struct ggml_allocator* allocator, struct ggml_tensor* 
 
           // if the node's data is external, then we cannot re-use it
           if (ggml_allocator_is_own(allocator, parent) == false) {
-            printf("not reusing parent %s for %s as %p is external\n", parent->name, node->name, parent->data);
+            debug("not reusing parent %s for %s as %p is external\n", parent->name, node->name, parent->data);
             continue;
           }
 
@@ -9672,12 +10104,12 @@ static void allocate_node(struct ggml_allocator* allocator, struct ggml_tensor* 
                 // we cannot free the tensor because the original address of the allocation is lost.
                 // adding a view_src pointer to the tensor would solve this and simplify the code dealing with views
                 // for now, we only reuse the parent's data if the offset is zero (view_src->data == parent->data)
-                printf("reusing view parent %s (%s) for %s\n", parent->name, view_src->name, node->name);
+                debug("reusing view parent %s (%s) for %s\n", parent->name, view_src->name, node->name);
                 node->data = parent->data;
                 return;
               }
             } else {
-              printf("reusing parent %s for %s\n", parent->name, node->name);
+              debug("reusing parent %s for %s\n", parent->name, node->name);
               node->data = parent->data;
               return;
             }
@@ -9702,11 +10134,11 @@ static void ggml_allocator_free_tensor(struct ggml_allocator* allocator, struct 
 
   size_t size = ggml_nbytes(tensor);
   size = aligned_offset(NULL, size, allocator->alignment);
-  printf("%s: freeing %s at %p (%zu bytes) - n_free_blocks = %d\n", __func__, tensor->name, ptr, size,
-         allocator->n_free_blocks);
-  printf("%s: allocator->data = %p allocator->data+allocator->size = %p allocator->data+allocator->max_size = %p\n",
-         __func__, allocator->data, (char*)allocator->data + allocator->size,
-         (char*)allocator->data + allocator->max_size);
+  debug("%s: freeing %s at %p (%zu bytes) - n_free_blocks = %d\n", __func__, tensor->name, ptr, size,
+        allocator->n_free_blocks);
+  debug("%s: allocator->data = %p allocator->data+allocator->size = %p allocator->data+allocator->max_size = %p\n",
+        __func__, allocator->data, (char*)allocator->data + allocator->size,
+        (char*)allocator->data + allocator->max_size);
 
 #ifdef GGML_ALLOCATOR_DEBUG
   remove_allocated_tensor(allocator, tensor);
@@ -9791,12 +10223,12 @@ static size_t ggml_allocator_alloc_graph_tensors_n(struct ggml_allocator* alloca
   // allocate tensors
   for (int g = 0; g < n_graphs; g++) {
     struct ggml_cgraph* gf = graphs[g];
-    printf("####### graph %d/%d\n", g, n_graphs);
+    debug("####### graph %d/%d\n", g, n_graphs);
     // graph inputs are allocated first to ensure that they are not overwritten by each other
     if (inputs != NULL && inputs[g] != NULL) {
       for (int i = 0; inputs[g][i] != NULL; i++) {
         struct ggml_tensor* input = inputs[g][i];
-        printf("input: %s\n", input->name);
+        debug("input: %s\n", input->name);
         allocate_node(allocator, input);
       }
     }
@@ -9822,18 +10254,18 @@ static size_t ggml_allocator_alloc_graph_tensors_n(struct ggml_allocator* alloca
         // allocate node
         allocate_node(allocator, node);
 
-        printf("exec: %s (%s) <= ", GGML_OP_NAMES[node->op], node->name);
+        debug("exec: %s (%s) <= ", GGML_OP_NAMES[node->op], node->name);
         for (int j = 0; j < GGML_MAX_SRC; j++) {
           struct ggml_tensor* parent = node->src[j];
           if (parent == NULL) {
             break;
           }
-          printf("%s", parent->name);
+          debug("%s", parent->name);
           if (j < GGML_MAX_SRC - 1 && node->src[j + 1] != NULL) {
-            printf(", ");
+            debug(", ");
           }
         }
-        printf("\n");
+        debug("\n");
       }
 
       // update parents
@@ -9861,8 +10293,8 @@ static size_t ggml_allocator_alloc_graph_tensors_n(struct ggml_allocator* alloca
                 struct ggml_tensor* view_src = parent->view_src;
                 struct hash_node* view_src_hn = hash_get(ht, view_src);
                 view_src_hn->n_views -= 1;
-                printf("view_src %s: %d children, %d views\n", view_src->name, view_src_hn->n_children,
-                       view_src_hn->n_views);
+                debug("view_src %s: %d children, %d views\n", view_src->name, view_src_hn->n_children,
+                      view_src_hn->n_views);
                 if (view_src_hn->n_views == 0 && view_src_hn->n_children == 0 && view_src->data != node->data) {
                   ggml_allocator_free_tensor(allocator, view_src);
                 }
@@ -9874,7 +10306,7 @@ static size_t ggml_allocator_alloc_graph_tensors_n(struct ggml_allocator* alloca
             }
           }
         }
-        printf("\n");
+        debug("\n");
         if (allocator->parse_seq_len) {
           last_barrier_pos = ind + 1;
         }
@@ -9884,7 +10316,7 @@ static size_t ggml_allocator_alloc_graph_tensors_n(struct ggml_allocator* alloca
     if (outputs != NULL && outputs[g] != NULL) {
       for (int i = 0; outputs[g][i] != NULL; i++) {
         struct ggml_tensor* output = outputs[g][i];
-        printf("output: %s\n", output->name);
+        debug("output: %s\n", output->name);
         ggml_allocator_free_tensor(allocator, output);
       }
     }
@@ -9936,8 +10368,8 @@ static void alloc_measure_vmem(void** base_addr, size_t* size) {
   do {
     *base_addr = alloc_vmem(*size);
     if (*base_addr != NULL) {
-      printf("allocated %.2f GB of virtual memory for measure buffer at %p\n", *size / 1024.0 / 1024.0 / 1024.0,
-             *base_addr);
+      debug("allocated %.2f GB of virtual memory for measure buffer at %p\n", *size / 1024.0 / 1024.0 / 1024.0,
+            *base_addr);
       return;
     }
     // try again with half the size
@@ -10003,6 +10435,777 @@ static void llama_log_callback_default(ggml_log_level level, const char* text, v
 #define llama_host_malloc(n) malloc(n)
 #define llama_host_free(data) free(data)
 #endif
+
+struct gpt_params {
+  uint32_t seed = -1;  // RNG seed
+  int32_t n_threads = get_num_physical_cores();
+  int32_t n_threads_batch = -1;     // number of threads to use for batch processing (-1 = use n_threads)
+  int32_t n_predict = -1;           // new tokens to predict
+  int32_t n_ctx = 512;              // context size
+  int32_t n_batch = 512;            // batch size for prompt processing (must be >=32 to use BLAS)
+  int32_t n_keep = 0;               // number of tokens to keep from initial prompt
+  int32_t n_draft = 16;             // number of tokens to draft during speculative decoding
+  int32_t n_chunks = -1;            // max number of chunks to process (-1 = unlimited)
+  int32_t n_parallel = 1;           // number of parallel sequences to decode
+  int32_t n_sequences = 1;          // number of sequences to decode
+  int32_t n_gpu_layers = -1;        // number of layers to store in VRAM (-1 - use default)
+  int32_t n_gpu_layers_draft = -1;  // number of layers to store in VRAM for the draft model (-1 - use default)
+  int32_t main_gpu = 0;             // the GPU that is used for scratch and small tensors
+  float tensor_split[LLAMA_MAX_DEVICES] = {0};  // how split tensors should be distributed across GPUs
+  int32_t n_probs = 0;                          // if greater than 0, output the probabilities of top n_probs tokens.
+  int32_t n_beams = 0;                          // if non-zero then use beam search of given width.
+  float rope_freq_base = 0.0f;                  // RoPE base frequency
+  float rope_freq_scale = 0.0f;                 // RoPE frequency scaling factor
+
+  // sampling parameters
+  int32_t top_k = 40;               // <= 0 to use vocab size
+  float top_p = 0.95f;              // 1.0 = disabled
+  float tfs_z = 1.00f;              // 1.0 = disabled
+  float typical_p = 1.00f;          // 1.0 = disabled
+  float temp = 0.80f;               // 1.0 = disabled
+  float repeat_penalty = 1.10f;     // 1.0 = disabled
+  int32_t repeat_last_n = 64;       // last n tokens to penalize (0 = disable penalty, -1 = context size)
+  float frequency_penalty = 0.00f;  // 0.0 = disabled
+  float presence_penalty = 0.00f;   // 0.0 = disabled
+  int32_t mirostat = 0;             // 0 = disabled, 1 = mirostat, 2 = mirostat 2.0
+  float mirostat_tau = 5.00f;       // target entropy
+  float mirostat_eta = 0.10f;       // learning rate
+
+  std::unordered_map<llama_token, float> logit_bias;  // logit bias for specific tokens
+
+  // Classifier-Free Guidance
+  // https://arxiv.org/abs/2306.17806
+  std::string cfg_negative_prompt;  // string to help guidance
+  float cfg_scale = 1.f;            // How strong is guidance
+
+  std::string model = "models/llama-2-13b-chat.Q4_0.gguf";  // model path
+  std::string model_draft = "";                             // draft model for speculative decoding
+  std::string model_alias = "unknown";                      // model alias
+  std::string prompt = "";
+  std::string path_prompt_cache = "";   // path to file for saving/loading prompt eval state
+  std::string input_prefix = "";        // string to prefix user inputs with
+  std::string input_suffix = "";        // string to suffix user inputs with
+  std::string grammar = "";             // optional BNF-like grammar to constrain sampling
+  std::vector<std::string> antiprompt;  // string upon seeing which more user input is prompted
+  std::string logdir = "";              // directory in which to save YAML log files
+
+  std::vector<std::tuple<std::string, float>> lora_adapter;  // lora adapter path with user defined scale
+  std::string lora_base = "";                                // base model path for the lora adapter
+
+  int ppl_stride = 0;       // stride for perplexity calculations. If left at 0, the pre-existing approach will be used.
+  int ppl_output_type = 0;  // = 0 -> ppl output is as usual, = 1 -> ppl output is num_tokens, ppl, one per line
+                            //                                       (which is more convenient to use for plotting)
+                            //
+  bool hellaswag = false;   // compute HellaSwag score over random tasks from datafile supplied in prompt
+  size_t hellaswag_tasks = 400;  // number of tasks to use when computing the HellaSwag score
+
+  bool mul_mat_q = true;          // if true, use mul_mat_q kernels instead of cuBLAS
+  bool memory_f16 = true;         // use f16 instead of f32 for memory kv
+  bool random_prompt = false;     // do not randomize prompt if none provided
+  bool use_color = false;         // use color to distinguish generations and inputs
+  bool interactive = false;       // interactive mode
+  bool prompt_cache_all = false;  // save user input and generations to prompt cache
+  bool prompt_cache_ro = false;   // open the prompt cache read-only and do not update it
+
+  bool embedding = false;          // get only sentence embedding
+  bool escape = false;             // escape "\n", "\r", "\t", "\'", "\"", and "\\"
+  bool interactive_first = false;  // wait for user input immediately
+  bool multiline_input = false;    // reverse the usage of `\`
+  bool simple_io = false;          // improves compatibility with subprocesses and limited consoles
+  bool cont_batching = false;      // insert new sequences for decoding on-the-fly
+
+  bool input_prefix_bos = false;  // prefix BOS to user inputs, preceding input_prefix
+  bool ignore_eos = false;        // ignore generated EOS tokens
+  bool instruct = false;          // instruction mode (used for Alpaca models)
+  bool penalize_nl = true;        // consider newlines as a repeatable token
+  bool logits_all = false;        // return logits for all tokens in the batch
+  bool use_mmap = true;           // use mmap for faster loads
+  bool use_mlock = false;         // use mlock to keep model in memory
+  bool numa = false;              // attempt optimizations that help on some NUMA systems
+  bool verbose_prompt = false;    // print prompt tokens before generation
+};
+
+void gpt_print_usage(int /*argc*/, char** argv, const gpt_params& params) {
+  printf("usage: %s [options]\n", argv[0]);
+  printf("\n");
+  printf("options:\n");
+  printf("  -h, --help            show this help message and exit\n");
+  printf("  -i, --interactive     run in interactive mode\n");
+  printf("  --interactive-first   run in interactive mode and wait for input right away\n");
+  printf("  -ins, --instruct      run in instruction mode (use with Alpaca models)\n");
+  printf("  --multiline-input     allows you to write or paste multiple lines without ending each in '\\'\n");
+  printf("  -r PROMPT, --reverse-prompt PROMPT\n");
+  printf("                        halt generation at PROMPT, return control in interactive mode\n");
+  printf("                        (can be specified more than once for multiple prompts).\n");
+  printf("  --color               colorise output to distinguish prompt and user input from generations\n");
+  printf("  -s SEED, --seed SEED  RNG seed (default: -1, use random seed for < 0)\n");
+  printf("  -t N, --threads N     number of threads to use during generation (default: %d)\n", params.n_threads);
+  printf("  -tb N, --threads-batch N\n");
+  printf(
+      "                        number of threads to use during batch and prompt processing (default: same as "
+      "--threads)\n");
+  printf("  -p PROMPT, --prompt PROMPT\n");
+  printf("                        prompt to start generation with (default: empty)\n");
+  printf("  -e, --escape          process prompt escapes sequences (\\n, \\r, \\t, \\', \\\", \\\\)\n");
+  printf("  --prompt-cache FNAME  file to cache prompt state for faster startup (default: none)\n");
+  printf("  --prompt-cache-all    if specified, saves user input and generations to cache as well.\n");
+  printf("                        not supported with --interactive or other interactive options\n");
+  printf("  --prompt-cache-ro     if specified, uses the prompt cache but does not update it.\n");
+  printf("  --random-prompt       start with a randomized prompt.\n");
+  printf("  --in-prefix-bos       prefix BOS to user inputs, preceding the `--in-prefix` string\n");
+  printf("  --in-prefix STRING    string to prefix user inputs with (default: empty)\n");
+  printf("  --in-suffix STRING    string to suffix after user inputs with (default: empty)\n");
+  printf("  -f FNAME, --file FNAME\n");
+  printf("                        prompt file to start generation.\n");
+  printf(
+      "  -n N, --n-predict N   number of tokens to predict (default: %d, -1 = infinity, -2 = until context filled)\n",
+      params.n_predict);
+  printf("  -c N, --ctx-size N    size of the prompt context (default: %d, 0 = loaded from model)\n", params.n_ctx);
+  printf("  -b N, --batch-size N  batch size for prompt processing (default: %d)\n", params.n_batch);
+  printf("  --top-k N             top-k sampling (default: %d, 0 = disabled)\n", params.top_k);
+  printf("  --top-p N             top-p sampling (default: %.1f, 1.0 = disabled)\n", (double)params.top_p);
+  printf("  --tfs N               tail free sampling, parameter z (default: %.1f, 1.0 = disabled)\n",
+         (double)params.tfs_z);
+  printf("  --typical N           locally typical sampling, parameter p (default: %.1f, 1.0 = disabled)\n",
+         (double)params.typical_p);
+  printf("  --repeat-last-n N     last n tokens to consider for penalize (default: %d, 0 = disabled, -1 = ctx_size)\n",
+         params.repeat_last_n);
+  printf("  --repeat-penalty N    penalize repeat sequence of tokens (default: %.1f, 1.0 = disabled)\n",
+         (double)params.repeat_penalty);
+  printf("  --presence-penalty N  repeat alpha presence penalty (default: %.1f, 0.0 = disabled)\n",
+         (double)params.presence_penalty);
+  printf("  --frequency-penalty N repeat alpha frequency penalty (default: %.1f, 0.0 = disabled)\n",
+         (double)params.frequency_penalty);
+  printf("  --mirostat N          use Mirostat sampling.\n");
+  printf("                        Top K, Nucleus, Tail Free and Locally Typical samplers are ignored if used.\n");
+  printf("                        (default: %d, 0 = disabled, 1 = Mirostat, 2 = Mirostat 2.0)\n", params.mirostat);
+  printf("  --mirostat-lr N       Mirostat learning rate, parameter eta (default: %.1f)\n",
+         (double)params.mirostat_eta);
+  printf("  --mirostat-ent N      Mirostat target entropy, parameter tau (default: %.1f)\n",
+         (double)params.mirostat_tau);
+  printf("  -l TOKEN_ID(+/-)BIAS, --logit-bias TOKEN_ID(+/-)BIAS\n");
+  printf("                        modifies the likelihood of token appearing in the completion,\n");
+  printf("                        i.e. `--logit-bias 15043+1` to increase likelihood of token ' Hello',\n");
+  printf("                        or `--logit-bias 15043-1` to decrease likelihood of token ' Hello'\n");
+  printf("  --grammar GRAMMAR     BNF-like grammar to constrain generations (see samples in grammars/ dir)\n");
+  printf("  --grammar-file FNAME  file to read grammar from\n");
+  printf("  --cfg-negative-prompt PROMPT\n");
+  printf("                        negative prompt to use for guidance. (default: empty)\n");
+  printf("  --cfg-negative-prompt-file FNAME\n");
+  printf("                        negative prompt file to use for guidance. (default: empty)\n");
+  printf("  --cfg-scale N         strength of guidance (default: %f, 1.0 = disable)\n", params.cfg_scale);
+  printf("  --rope-scale N        RoPE context linear scaling factor, inverse of --rope-freq-scale\n");
+  printf("  --rope-freq-base N    RoPE base frequency, used by NTK-aware scaling (default: loaded from model)\n");
+  printf("  --rope-freq-scale N   RoPE frequency linear scaling factor (default: loaded from model)\n");
+  printf("  --ignore-eos          ignore end of stream token and continue generating (implies --logit-bias 2-inf)\n");
+  printf("  --no-penalize-nl      do not penalize newline token\n");
+  printf("  --memory-f32          use f32 instead of f16 for memory key+value (default: disabled)\n");
+  printf(
+      "                        not recommended: doubles context memory required and no measurable increase in "
+      "quality\n");
+  printf("  --temp N              temperature (default: %.1f)\n", (double)params.temp);
+  printf("  --logits-all          return logits for all tokens in the batch (default: disabled)\n");
+  printf("  --hellaswag           compute HellaSwag score over random tasks from datafile supplied with -f\n");
+  printf("  --hellaswag-tasks N   number of tasks to use when computing the HellaSwag score (default: %zu)\n",
+         params.hellaswag_tasks);
+  printf("  --keep N              number of tokens to keep from the initial prompt (default: %d, -1 = all)\n",
+         params.n_keep);
+  printf("  --draft N             number of tokens to draft for speculative decoding (default: %d)\n", params.n_draft);
+  printf("  --chunks N            max number of chunks to process (default: %d, -1 = all)\n", params.n_chunks);
+  printf("  -np N, --parallel N   number of parallel sequences to decode (default: %d)\n", params.n_parallel);
+  printf("  -ns N, --sequences N  number of sequences to decode (default: %d)\n", params.n_sequences);
+  printf("  -cb, --cont-batching  enable continuous batching (a.k.a dynamic batching) (default: disabled)\n");
+  // if (llama_mlock_supported()) {
+  //   printf("  --mlock               force system to keep model in RAM rather than swapping or compressing\n");
+  // }
+  // if (llama_mmap_supported()) {
+  //   printf(
+  //       "  --no-mmap             do not memory-map model (slower load but may reduce pageouts if not using
+  //       mlock)\n");
+  // }
+  printf("  --numa                attempt optimizations that help on some NUMA systems\n");
+  printf(
+      "                        if run without this previously, it is recommended to drop the system page cache before "
+      "using this\n");
+  printf("                        see https://github.com/ggerganov/llama.cpp/issues/1437\n");
+#ifdef LLAMA_SUPPORTS_GPU_OFFLOAD
+  printf("  -ngl N, --n-gpu-layers N\n");
+  printf("                        number of layers to store in VRAM\n");
+  printf("  -ngld N, --n-gpu-layers-draft N\n");
+  printf("                        number of layers to store in VRAM for the draft model\n");
+  printf("  -ts SPLIT --tensor-split SPLIT\n");
+  printf(
+      "                        how to split tensors across multiple GPUs, comma-separated list of proportions, e.g. "
+      "3,1\n");
+  printf("  -mg i, --main-gpu i   the GPU to use for scratch and small tensors\n");
+#ifdef GGML_USE_CUBLAS
+  printf("  -nommq, --no-mul-mat-q\n");
+  printf("                        use " GGML_CUBLAS_NAME " instead of custom mul_mat_q " GGML_CUDA_NAME " kernels.\n");
+  printf("                        Not recommended since this is both slower and uses more VRAM.\n");
+#endif  // GGML_USE_CUBLAS
+#endif
+  printf("  --verbose-prompt      print prompt before generation\n");
+  fprintf(stderr,
+          "  --simple-io           use basic IO for better compatibility in subprocesses and limited consoles\n");
+  printf("  --lora FNAME          apply LoRA adapter (implies --no-mmap)\n");
+  printf("  --lora-scaled FNAME S apply LoRA adapter with user defined scaling S (implies --no-mmap)\n");
+  printf("  --lora-base FNAME     optional model to use as a base for the layers modified by the LoRA adapter\n");
+  printf("  -m FNAME, --model FNAME\n");
+  printf("                        model path (default: %s)\n", params.model.c_str());
+  printf("  -md FNAME, --model-draft FNAME\n");
+  printf("                        draft model for speculative decoding (default: %s)\n", params.model.c_str());
+  printf("  -ld LOGDIR, --logdir LOGDIR\n");
+  printf("                        path under which to save YAML logs (no logging if unset)\n");
+  printf("\n");
+}
+
+bool gpt_params_parse(int argc, char** argv, gpt_params& params) {
+  bool invalid_param = false;
+  std::string arg;
+  gpt_params default_params;
+  const std::string arg_prefix = "--";
+
+  for (int i = 1; i < argc; i++) {
+    arg = argv[i];
+    if (arg.compare(0, arg_prefix.size(), arg_prefix) == 0) {
+      std::replace(arg.begin(), arg.end(), '_', '-');
+    }
+
+    if (arg == "-s" || arg == "--seed") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.seed = std::stoul(argv[i]);
+    } else if (arg == "-t" || arg == "--threads") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.n_threads = std::stoi(argv[i]);
+      if (params.n_threads <= 0) {
+        params.n_threads = std::thread::hardware_concurrency();
+      }
+    } else if (arg == "-tb" || arg == "--threads-batch") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.n_threads_batch = std::stoi(argv[i]);
+      if (params.n_threads_batch <= 0) {
+        params.n_threads_batch = std::thread::hardware_concurrency();
+      }
+    } else if (arg == "-p" || arg == "--prompt") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.prompt = argv[i];
+    } else if (arg == "-e" || arg == "--escape") {
+      params.escape = true;
+    } else if (arg == "--prompt-cache") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.path_prompt_cache = argv[i];
+    } else if (arg == "--prompt-cache-all") {
+      params.prompt_cache_all = true;
+    } else if (arg == "--prompt-cache-ro") {
+      params.prompt_cache_ro = true;
+    } else if (arg == "-f" || arg == "--file") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      std::ifstream file(argv[i]);
+      if (!file) {
+        fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
+        invalid_param = true;
+        break;
+      }
+      std::copy(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>(), back_inserter(params.prompt));
+      if (params.prompt.back() == '\n') {
+        params.prompt.pop_back();
+      }
+    } else if (arg == "-n" || arg == "--n-predict") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.n_predict = std::stoi(argv[i]);
+    } else if (arg == "--top-k") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.top_k = std::stoi(argv[i]);
+    } else if (arg == "-c" || arg == "--ctx-size") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.n_ctx = std::stoi(argv[i]);
+    } else if (arg == "--rope-freq-base") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.rope_freq_base = std::stof(argv[i]);
+    } else if (arg == "--rope-freq-scale") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.rope_freq_scale = std::stof(argv[i]);
+    } else if (arg == "--rope-scale") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.rope_freq_scale = 1.0f / std::stof(argv[i]);
+    } else if (arg == "--memory-f32") {
+      params.memory_f16 = false;
+    } else if (arg == "--top-p") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.top_p = std::stof(argv[i]);
+    } else if (arg == "--temp") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.temp = std::stof(argv[i]);
+    } else if (arg == "--tfs") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.tfs_z = std::stof(argv[i]);
+    } else if (arg == "--typical") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.typical_p = std::stof(argv[i]);
+    } else if (arg == "--repeat-last-n") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.repeat_last_n = std::stoi(argv[i]);
+    } else if (arg == "--repeat-penalty") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.repeat_penalty = std::stof(argv[i]);
+    } else if (arg == "--frequency-penalty") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.frequency_penalty = std::stof(argv[i]);
+    } else if (arg == "--presence-penalty") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.presence_penalty = std::stof(argv[i]);
+    } else if (arg == "--mirostat") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.mirostat = std::stoi(argv[i]);
+    } else if (arg == "--mirostat-lr") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.mirostat_eta = std::stof(argv[i]);
+    } else if (arg == "--mirostat-ent") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.mirostat_tau = std::stof(argv[i]);
+    } else if (arg == "--cfg-negative-prompt") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.cfg_negative_prompt = argv[i];
+    } else if (arg == "--cfg-negative-prompt-file") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      std::ifstream file(argv[i]);
+      if (!file) {
+        fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
+        invalid_param = true;
+        break;
+      }
+      std::copy(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>(),
+                back_inserter(params.cfg_negative_prompt));
+      if (params.cfg_negative_prompt.back() == '\n') {
+        params.cfg_negative_prompt.pop_back();
+      }
+    } else if (arg == "--cfg-scale") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.cfg_scale = std::stof(argv[i]);
+    } else if (arg == "-b" || arg == "--batch-size") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.n_batch = std::stoi(argv[i]);
+    } else if (arg == "--keep") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.n_keep = std::stoi(argv[i]);
+    } else if (arg == "--draft") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.n_draft = std::stoi(argv[i]);
+    } else if (arg == "--chunks") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.n_chunks = std::stoi(argv[i]);
+    } else if (arg == "-np" || arg == "--parallel") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.n_parallel = std::stoi(argv[i]);
+    } else if (arg == "-ns" || arg == "--sequences") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.n_sequences = std::stoi(argv[i]);
+    } else if (arg == "-m" || arg == "--model") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.model = argv[i];
+    } else if (arg == "-md" || arg == "--model-draft") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.model_draft = argv[i];
+    } else if (arg == "-a" || arg == "--alias") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.model_alias = argv[i];
+    } else if (arg == "--lora") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.lora_adapter.push_back({argv[i], 1.0f});
+      params.use_mmap = false;
+    } else if (arg == "--lora-scaled") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      const char* lora_adapter = argv[i];
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.lora_adapter.push_back({lora_adapter, std::stof(argv[i])});
+      params.use_mmap = false;
+    } else if (arg == "--lora-base") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.lora_base = argv[i];
+    } else if (arg == "-i" || arg == "--interactive") {
+      params.interactive = true;
+    } else if (arg == "--embedding") {
+      params.embedding = true;
+    } else if (arg == "--interactive-first") {
+      params.interactive_first = true;
+    } else if (arg == "-ins" || arg == "--instruct") {
+      params.instruct = true;
+    } else if (arg == "--multiline-input") {
+      params.multiline_input = true;
+    } else if (arg == "--simple-io") {
+      params.simple_io = true;
+    } else if (arg == "-cb" || arg == "--cont-batching") {
+      params.cont_batching = true;
+    } else if (arg == "--color") {
+      params.use_color = true;
+    } else if (arg == "--mlock") {
+      params.use_mlock = true;
+    } else if (arg == "--gpu-layers" || arg == "-ngl" || arg == "--n-gpu-layers") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+#ifdef LLAMA_SUPPORTS_GPU_OFFLOAD
+      params.n_gpu_layers = std::stoi(argv[i]);
+#else
+      fprintf(stderr, "warning: not compiled with GPU offload support, --n-gpu-layers option will be ignored\n");
+      fprintf(stderr, "warning: see main README.md for information on enabling GPU BLAS support\n");
+#endif
+    } else if (arg == "--gpu-layers-draft" || arg == "-ngld" || arg == "--n-gpu-layers-draft") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+#ifdef LLAMA_SUPPORTS_GPU_OFFLOAD
+      params.n_gpu_layers_draft = std::stoi(argv[i]);
+#else
+      fprintf(stderr, "warning: not compiled with GPU offload support, --n-gpu-layers-draft option will be ignored\n");
+      fprintf(stderr, "warning: see main README.md for information on enabling GPU BLAS support\n");
+#endif
+    } else if (arg == "--main-gpu" || arg == "-mg") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+#ifdef GGML_USE_CUBLAS
+      params.main_gpu = std::stoi(argv[i]);
+#else
+      fprintf(stderr, "warning: llama.cpp was compiled without cuBLAS. It is not possible to set a main GPU.\n");
+#endif
+    } else if (arg == "--tensor-split" || arg == "-ts") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+#ifdef GGML_USE_CUBLAS
+      std::string arg_next = argv[i];
+
+      // split string by , and /
+      const std::regex regex{R"([,/]+)"};
+      std::sregex_token_iterator it{arg_next.begin(), arg_next.end(), regex, -1};
+      std::vector<std::string> split_arg{it, {}};
+      GGML_ASSERT(split_arg.size() <= LLAMA_MAX_DEVICES);
+
+      for (size_t i = 0; i < LLAMA_MAX_DEVICES; ++i) {
+        if (i < split_arg.size()) {
+          params.tensor_split[i] = std::stof(split_arg[i]);
+        } else {
+          params.tensor_split[i] = 0.0f;
+        }
+      }
+#else
+      fprintf(stderr, "warning: llama.cpp was compiled without cuBLAS. It is not possible to set a tensor split.\n");
+#endif  // GGML_USE_CUBLAS
+    } else if (arg == "--no-mul-mat-q" || arg == "-nommq") {
+#ifdef GGML_USE_CUBLAS
+      params.mul_mat_q = false;
+#else
+      fprintf(stderr, "warning: llama.cpp was compiled without cuBLAS. Disabling mul_mat_q kernels has no effect.\n");
+#endif  // GGML_USE_CUBLAS
+    } else if (arg == "--no-mmap") {
+      params.use_mmap = false;
+    } else if (arg == "--numa") {
+      params.numa = true;
+    } else if (arg == "--verbose-prompt") {
+      params.verbose_prompt = true;
+    } else if (arg == "-r" || arg == "--reverse-prompt") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.antiprompt.push_back(argv[i]);
+    } else if (arg == "-ld" || arg == "--logdir") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.logdir = argv[i];
+
+      if (params.logdir.back() != DIRECTORY_SEPARATOR) {
+        params.logdir += DIRECTORY_SEPARATOR;
+      }
+    } else if (arg == "--perplexity" || arg == "--all-logits") {
+      params.logits_all = true;
+    } else if (arg == "--ppl-stride") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.ppl_stride = std::stoi(argv[i]);
+    } else if (arg == "--ppl-output-type") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.ppl_output_type = std::stoi(argv[i]);
+    } else if (arg == "--hellaswag") {
+      params.hellaswag = true;
+    } else if (arg == "--hellaswag-tasks") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.hellaswag_tasks = std::stoi(argv[i]);
+    } else if (arg == "--ignore-eos") {
+      params.ignore_eos = true;
+    } else if (arg == "--no-penalize-nl") {
+      params.penalize_nl = false;
+    } else if (arg == "-l" || arg == "--logit-bias") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      std::stringstream ss(argv[i]);
+      llama_token key;
+      char sign;
+      std::string value_str;
+      try {
+        if (ss >> key && ss >> sign && std::getline(ss, value_str) && (sign == '+' || sign == '-')) {
+          params.logit_bias[key] = std::stof(value_str) * ((sign == '-') ? -1.0f : 1.0f);
+        } else {
+          throw std::exception();
+        }
+      } catch (const std::exception&) {
+        invalid_param = true;
+        break;
+      }
+    } else if (arg == "-h" || arg == "--help") {
+      gpt_print_usage(argc, argv, default_params);
+#ifndef LOG_DISABLE_LOGS
+      // log_print_usage();
+#endif  // LOG_DISABLE_LOGS
+      exit(0);
+    } else if (arg == "--random-prompt") {
+      params.random_prompt = true;
+    } else if (arg == "--in-prefix-bos") {
+      params.input_prefix_bos = true;
+    } else if (arg == "--in-prefix") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.input_prefix = argv[i];
+    } else if (arg == "--in-suffix") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.input_suffix = argv[i];
+    } else if (arg == "--grammar") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      params.grammar = argv[i];
+    } else if (arg == "--grammar-file") {
+      if (++i >= argc) {
+        invalid_param = true;
+        break;
+      }
+      std::ifstream file(argv[i]);
+      if (!file) {
+        fprintf(stderr, "error: failed to open file '%s'\n", argv[i]);
+        invalid_param = true;
+        break;
+      }
+      std::copy(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>(),
+                std::back_inserter(params.grammar));
+      // #ifndef LOG_DISABLE_LOGS
+      //       // Parse args for logging parameters
+      //     } else if (log_param_single_parse(argv[i])) {
+      //       // Do nothing, log_param_single_parse automatically does it's thing
+      //       //  and returns if a match was found and parsed.
+      //     } else if (log_param_pair_parse(/*check_but_dont_parse*/ true, argv[i])) {
+      //       // We have a matching known parameter requiring an argument,
+      //       //  now we need to check if there is anything after this argv
+      //       //  and flag invalid_param or parse it.
+      //       if (++i >= argc) {
+      //         invalid_param = true;
+      //         break;
+      //       }
+      //       if (!log_param_pair_parse(/*check_but_dont_parse*/ false, argv[i - 1], argv[i])) {
+      //         invalid_param = true;
+      //         break;
+      //       }
+      //       // End of Parse args for logging parameters
+      // #endif  // LOG_DISABLE_LOGS
+    } else {
+      fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
+      gpt_print_usage(argc, argv, default_params);
+      exit(1);
+    }
+  }
+  if (invalid_param) {
+    fprintf(stderr, "error: invalid parameter for argument: %s\n", arg.c_str());
+    gpt_print_usage(argc, argv, default_params);
+    exit(1);
+  }
+  if (params.prompt_cache_all && (params.interactive || params.interactive_first || params.instruct)) {
+    fprintf(stderr, "error: --prompt-cache-all not supported in interactive mode yet\n");
+    gpt_print_usage(argc, argv, default_params);
+    exit(1);
+  }
+
+  if (params.escape) {
+    process_escapes(params.prompt);
+    process_escapes(params.input_prefix);
+    process_escapes(params.input_suffix);
+  }
+
+  return true;
+}
+
+const char* llama_print_system_info(void) {
+  static std::string s;
+
+  s = "";
+  s += "AVX = " + std::to_string(ggml_cpu_has_avx()) + " | ";
+  s += "AVX2 = " + std::to_string(ggml_cpu_has_avx2()) + " | ";
+  s += "AVX512 = " + std::to_string(ggml_cpu_has_avx512()) + " | ";
+  s += "AVX512_VBMI = " + std::to_string(ggml_cpu_has_avx512_vbmi()) + " | ";
+  s += "AVX512_VNNI = " + std::to_string(ggml_cpu_has_avx512_vnni()) + " | ";
+  s += "FMA = " + std::to_string(ggml_cpu_has_fma()) + " | ";
+  s += "NEON = " + std::to_string(ggml_cpu_has_neon()) + " | ";
+  s += "ARM_FMA = " + std::to_string(ggml_cpu_has_arm_fma()) + " | ";
+  s += "F16C = " + std::to_string(ggml_cpu_has_f16c()) + " | ";
+  s += "FP16_VA = " + std::to_string(ggml_cpu_has_fp16_va()) + " | ";
+  s += "WASM_SIMD = " + std::to_string(ggml_cpu_has_wasm_simd()) + " | ";
+  s += "BLAS = " + std::to_string(ggml_cpu_has_blas()) + " | ";
+  s += "SSE3 = " + std::to_string(ggml_cpu_has_sse3()) + " | ";
+  s += "SSSE3 = " + std::to_string(ggml_cpu_has_ssse3()) + " | ";
+  s += "VSX = " + std::to_string(ggml_cpu_has_vsx()) + " | ";
+
+  return s.c_str();
+}
+
+std::string get_system_info(const gpt_params& params) {
+  std::ostringstream os;
+
+  os << "system_info: n_threads = " << params.n_threads;
+  if (params.n_threads_batch != -1) {
+    os << " (n_threads_batch = " << params.n_threads_batch << ")";
+  }
+  os << " / " << std::thread::hardware_concurrency() << " | " << llama_print_system_info();
+
+  return os.str();
+}
 
 void llama_backend_init(bool numa) {
   ggml_time_init();
@@ -11656,6 +12859,858 @@ struct llama_context* llama_new_context(llama_model* model, struct llama_context
   return lctx;
 }
 
+// SPM tokenizer
+// original implementation:
+// https://github.com/ggerganov/llama.cpp/commit/074bea2eb1f1349a0118239c4152914aecaa1be4
+
+struct llm_bigram_spm {
+  struct comparator {
+    bool operator()(llm_bigram_spm& l, llm_bigram_spm& r) {
+      return (l.score < r.score) || (l.score == r.score && l.left > r.left);
+    }
+  };
+  using queue_storage = std::vector<llm_bigram_spm>;
+  using queue = std::priority_queue<llm_bigram_spm, queue_storage, comparator>;
+  llm_symbol::index left;
+  llm_symbol::index right;
+  float score;
+  size_t size;
+};
+
+struct llm_tokenizer_spm {
+  llm_tokenizer_spm(const llama_vocab& vocab) : vocab(vocab) {}
+
+  void tokenize(const std::string& text, std::vector<llama_vocab::id>& output) {
+    // split string into utf8 chars
+    int index = 0;
+    size_t offs = 0;
+    while (offs < text.size()) {
+      llm_symbol sym;
+      size_t len = utf8_len(text[offs]);
+      sym.text = text.c_str() + offs;
+      sym.n = std::min(len, text.size() - offs);
+      offs += sym.n;
+      sym.prev = index - 1;
+      sym.next = offs == text.size() ? -1 : index + 1;
+      index++;
+      symbols.emplace_back(sym);
+    }
+
+    // seed the work queue with all possible 2-character tokens.
+    for (size_t i = 1; i < symbols.size(); ++i) {
+      try_add_bigram(i - 1, i);
+    }
+
+    // keep substituting the highest frequency pairs for as long as we can.
+    while (!work_queue.empty()) {
+      auto bigram = work_queue.top();
+      work_queue.pop();
+
+      auto& left_sym = symbols[bigram.left];
+      auto& right_sym = symbols[bigram.right];
+
+      // if one of the symbols already got merged, skip it.
+      if (left_sym.n == 0 || right_sym.n == 0 || left_sym.n + right_sym.n != bigram.size) {
+        continue;
+      }
+
+      // merge the right sym into the left one
+      left_sym.n += right_sym.n;
+      right_sym.n = 0;
+
+      // LLAMA_LOG_INFO("left = '%*s' size = %zu\n", (int) left_sym.n, left_sym.text, bigram.size);
+
+      // remove the right sym from the chain
+      left_sym.next = right_sym.next;
+      if (right_sym.next >= 0) {
+        symbols[right_sym.next].prev = bigram.left;
+      }
+
+      // find more substitutions
+      try_add_bigram(left_sym.prev, bigram.left);
+      try_add_bigram(bigram.left, left_sym.next);
+    }
+
+    for (int i = 0; i != -1; i = symbols[i].next) {
+      auto& symbol = symbols[i];
+      resegment(symbol, output);
+    }
+  }
+
+ private:
+  void resegment(llm_symbol& symbol, std::vector<llama_vocab::id>& output) {
+    auto text = std::string(symbol.text, symbol.n);
+    auto token = vocab.token_to_id.find(text);
+
+    // Do we need to support is_unused?
+    if (token != vocab.token_to_id.end()) {
+      output.push_back((*token).second);
+      return;
+    }
+
+    const auto p = rev_merge.find(text);
+
+    if (p == rev_merge.end()) {
+      // output any symbols that did not form tokens as bytes.
+      for (int j = 0; j < (int)symbol.n; ++j) {
+        llama_vocab::id token_id = llama_byte_to_token(vocab, symbol.text[j]);
+        output.push_back(token_id);
+      }
+      return;
+    }
+
+    resegment(symbols[p->second.first], output);
+    resegment(symbols[p->second.second], output);
+  }
+
+  void try_add_bigram(int left, int right) {
+    if (left == -1 || right == -1) {
+      return;
+    }
+
+    const std::string text = std::string(symbols[left].text, symbols[left].n + symbols[right].n);
+    auto token = vocab.token_to_id.find(text);
+
+    if (token == vocab.token_to_id.end()) {
+      return;
+    }
+
+    if (static_cast<size_t>((*token).second) >= vocab.id_to_token.size()) {
+      return;
+    }
+
+    const auto& tok_data = vocab.id_to_token[(*token).second];
+
+    llm_bigram_spm bigram;
+    bigram.left = left;
+    bigram.right = right;
+    bigram.score = tok_data.score;
+    bigram.size = text.size();
+
+    work_queue.push(bigram);
+
+    // Do we need to support is_unused?
+    rev_merge[text] = std::make_pair(left, right);
+  }
+
+  const llama_vocab& vocab;
+
+  std::vector<llm_symbol> symbols;
+  llm_bigram_spm::queue work_queue;
+
+  std::map<std::string, std::pair<int, int>> rev_merge;
+};
+
+static void llama_escape_whitespace(std::string& text) { replace_all(text, " ", "\xe2\x96\x81"); }
+
+static void llama_unescape_whitespace(std::string& word) { replace_all(word, "\xe2\x96\x81", " "); }
+
+int llama_n_vocab(const struct llama_model* model) { return model->vocab.id_to_token.size(); }
+
+enum llama_vocab_type llama_vocab_type(const struct llama_model* model) { return model->vocab.type; }
+
+static enum llama_vocab_type llama_vocab_get_type(const llama_vocab& vocab) { return vocab.type; }
+
+static bool llama_is_normal_token(const llama_vocab& vocab, llama_token id) {
+  return vocab.id_to_token[id].type == LLAMA_TOKEN_TYPE_NORMAL;
+}
+
+static bool llama_is_unknown_token(const llama_vocab& vocab, llama_token id) {
+  return vocab.id_to_token[id].type == LLAMA_TOKEN_TYPE_UNKNOWN;
+}
+
+static bool llama_is_control_token(const llama_vocab& vocab, llama_token id) {
+  return vocab.id_to_token[id].type == LLAMA_TOKEN_TYPE_CONTROL;
+}
+
+static bool llama_is_byte_token(const llama_vocab& vocab, llama_token id) {
+  return vocab.id_to_token[id].type == LLAMA_TOKEN_TYPE_BYTE;
+}
+
+static uint8_t llama_token_to_byte(const llama_vocab& vocab, llama_token id) {
+  GGML_ASSERT(llama_is_byte_token(vocab, id));
+  const auto& token_data = vocab.id_to_token.at(id);
+  auto buf = token_data.text.substr(3, 2);
+  return strtol(buf.c_str(), NULL, 16);
+}
+
+// does not write null-terminator to buf
+int llama_token_to_piece(const struct llama_model* model, llama_token token, char* buf, int length) {
+  if (0 <= token && token < llama_n_vocab(model)) {
+    if (llama_is_normal_token(model->vocab, token)) {
+      std::string result = model->vocab.id_to_token[token].text;
+      if (llama_vocab_get_type(model->vocab) == LLAMA_VOCAB_TYPE_SPM) {
+        llama_unescape_whitespace(result);
+      }
+      if (length < (int)result.length()) {
+        return -result.length();
+      }
+      memcpy(buf, result.c_str(), result.length());
+      return result.length();
+    } else if (llama_is_unknown_token(model->vocab, token)) {  // NOLINT
+      if (length < 3) {
+        return -3;
+      }
+      buf[0] = '\xe2';
+      buf[1] = '\x96';
+      buf[2] = '\x85';
+      return 3;
+    } else if (llama_is_control_token(model->vocab, token)) {
+      // do nothing
+    } else if (llama_is_byte_token(model->vocab, token)) {
+      if (length < 1) {
+        return -1;
+      }
+      buf[0] = llama_token_to_byte(model->vocab, token);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+std::string llama_token_to_piece(const struct llama_context* lctx, llama_token token) {
+  std::vector<char> result(8, 0);
+  const int n_tokens = llama_token_to_piece(lctx->model, token, result.data(), result.size());
+  if (n_tokens < 0) {
+    result.resize(-n_tokens);
+    int check = llama_token_to_piece(lctx->model, token, result.data(), result.size());
+    GGML_ASSERT(check == -n_tokens);
+  } else {
+    result.resize(n_tokens);
+  }
+
+  return std::string(result.data(), result.size());
+}
+
+std::string log_tokens_tostr_pretty(const struct llama_context* lctx, std::vector<llama_token>& tokens) {
+  std::stringstream buf;
+  buf << "[ ";
+
+  bool first = true;
+  for (const auto& token : tokens) {
+    if (!first)
+      buf << ", ";
+    else
+      first = false;
+
+    auto detokenized = llama_token_to_piece(lctx, token);
+
+    detokenized.erase(
+        std::remove_if(detokenized.begin(), detokenized.end(), [](const unsigned char c) { return !std::isprint(c); }),
+        detokenized.end());
+
+    buf << "'" << detokenized << "'"
+        << ":" << std::to_string(token);
+  }
+  buf << " ]";
+
+  return buf.str();
+}
+
+static std::vector<llama_vocab::id> llama_tokenize_internal(const llama_vocab& vocab, std::string raw_text, bool bos) {
+  std::vector<llama_vocab::id> output;
+
+  // OG tokenizer behavior:
+  //
+  // tokenizer.encode('', add_bos=True)  returns [1]
+  // tokenizer.encode('', add_bos=False) returns []
+
+  if (bos && vocab.special_bos_id != -1) {
+    output.push_back(vocab.special_bos_id);
+  }
+
+  if (raw_text.empty()) {
+    return output;
+  }
+
+  switch (vocab.type) {
+    case LLAMA_VOCAB_TYPE_SPM: {
+      // without adding this leading whitespace, we do not get the same results as the original tokenizer
+      raw_text = " " + raw_text;
+
+      llm_tokenizer_spm tokenizer(vocab);
+      llama_escape_whitespace(raw_text);
+      tokenizer.tokenize(raw_text, output);
+    } break;
+    case LLAMA_VOCAB_TYPE_BPE: {
+      llm_tokenizer_bpe tokenizer(vocab);
+      tokenizer.tokenize(raw_text, output);
+    } break;
+  }
+
+  return output;
+}
+
+int llama_tokenize(const struct llama_model* model, const char* text, int text_len, llama_token* tokens,
+                   int n_max_tokens, bool add_bos) {
+  auto res = llama_tokenize_internal(model->vocab, std::string(text, text_len), add_bos);
+
+  if (n_max_tokens < (int)res.size()) {
+    // LLAMA_LOG_ERROR("%s: too many tokens\n", __func__);
+    return -((int)res.size());
+  }
+
+  for (size_t i = 0; i < res.size(); i++) {
+    tokens[i] = res[i];
+  }
+
+  return res.size();
+}
+
+std::vector<llama_token> llama_tokenize(const struct llama_model* model, const std::string& text, bool add_bos) {
+  // upper limit for the number of tokens
+  int n_tokens = text.length() + add_bos;
+  std::vector<llama_token> result(n_tokens);
+  n_tokens = llama_tokenize(model, text.data(), text.length(), result.data(), result.size(), add_bos);
+  if (n_tokens < 0) {
+    result.resize(-n_tokens);
+    int check = llama_tokenize(model, text.data(), text.length(), result.data(), result.size(), add_bos);
+    GGML_ASSERT(check == -n_tokens);
+  } else {
+    result.resize(n_tokens);
+  }
+  return result;
+}
+
+llama_token llama_sample_token_greedy(struct llama_context* ctx, llama_token_data_array* candidates) {
+  const int64_t t_start_sample_us = ggml_time_us();
+
+  // Find max element
+  auto* max_iter =
+      std::max_element(candidates->data, candidates->data + candidates->size,
+                       [](const llama_token_data& a, const llama_token_data& b) { return a.logit < b.logit; });
+
+  llama_token result = max_iter->id;
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+    ctx->n_sample++;
+  }
+  return result;
+}
+
+float* llama_get_logits_ith(struct llama_context* ctx, int32_t i) {
+  return ctx->logits.data() + i * ctx->model->hparams.n_vocab;
+}
+
+void llama_sample_repetition_penalty(struct llama_context* ctx, llama_token_data_array* candidates,
+                                     const llama_token* last_tokens, size_t last_tokens_size, float penalty) {
+  if (last_tokens_size == 0 || penalty == 1.0f) {
+    return;
+  }
+
+  const int64_t t_start_sample_us = ggml_time_us();
+
+  for (size_t i = 0; i < candidates->size; ++i) {
+    const auto* token_iter = std::find(last_tokens, last_tokens + last_tokens_size, candidates->data[i].id);
+    if (token_iter == last_tokens + last_tokens_size) {
+      continue;
+    }
+
+    // The academic publication that described this technique actually just only divided, but that would cause tokens
+    // with negative logits to become more likely, which is obviously wrong. This is common fix for this problem, which
+    // is to multiply by the penalty instead of dividing.
+    if (candidates->data[i].logit <= 0) {
+      candidates->data[i].logit *= penalty;
+    } else {
+      candidates->data[i].logit /= penalty;
+    }
+  }
+
+  candidates->sorted = false;
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+}
+
+void llama_sample_frequency_and_presence_penalties(struct llama_context* ctx, llama_token_data_array* candidates,
+                                                   const llama_token* last_tokens_p, size_t last_tokens_size,
+                                                   float alpha_frequency, float alpha_presence) {
+  if (last_tokens_size == 0 || (alpha_frequency == 0.0f && alpha_presence == 0.0f)) {
+    return;
+  }
+
+  const int64_t t_start_sample_us = ggml_time_us();
+
+  // Create a frequency map to count occurrences of each token in last_tokens
+  std::unordered_map<llama_token, int> token_count;
+  for (size_t i = 0; i < last_tokens_size; ++i) {
+    token_count[last_tokens_p[i]]++;
+  }
+
+  // Apply frequency and presence penalties to the candidates
+  for (size_t i = 0; i < candidates->size; ++i) {
+    auto token_iter = token_count.find(candidates->data[i].id);
+    if (token_iter == token_count.end()) {
+      continue;
+    }
+
+    int count = token_iter->second;
+    candidates->data[i].logit -= float(count) * alpha_frequency + float(count > 0) * alpha_presence;
+  }
+
+  candidates->sorted = false;
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+}
+
+void llama_sample_temp(struct llama_context* ctx, llama_token_data_array* candidates_p, float temp) {
+  const int64_t t_start_sample_us = ggml_time_us();
+
+  for (size_t i = 0; i < candidates_p->size; ++i) {
+    candidates_p->data[i].logit /= temp;
+  }
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+}
+
+void llama_sample_softmax(struct llama_context* ctx, llama_token_data_array* candidates) {
+  GGML_ASSERT(candidates->size > 0);
+
+  const int64_t t_start_sample_us = ggml_time_us();
+
+  // Sort the logits in descending order
+  if (!candidates->sorted) {
+    std::sort(candidates->data, candidates->data + candidates->size,
+              [](const llama_token_data& a, const llama_token_data& b) { return a.logit > b.logit; });
+    candidates->sorted = true;
+  }
+
+  float max_l = candidates->data[0].logit;
+  float cum_sum = 0.0f;
+  for (size_t i = 0; i < candidates->size; ++i) {
+    float p = expf(candidates->data[i].logit - max_l);
+    candidates->data[i].p = p;
+    cum_sum += p;
+  }
+  for (size_t i = 0; i < candidates->size; ++i) {
+    candidates->data[i].p /= cum_sum;
+  }
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+}
+
+llama_token llama_sample_token_mirostat(struct llama_context* ctx, llama_token_data_array* candidates, float tau,
+                                        float eta, int m, float* mu) {
+  GGML_ASSERT(ctx);
+
+  auto N = float(llama_n_vocab(ctx->model));
+  int64_t t_start_sample_us;
+  t_start_sample_us = ggml_time_us();
+
+  llama_sample_softmax(nullptr, candidates);
+
+  // Estimate s_hat using the most probable m tokens
+  float s_hat = 0.0;
+  float sum_ti_bi = 0.0;
+  float sum_ti_sq = 0.0;
+  for (size_t i = 0; i < size_t(m - 1) && i < candidates->size - 1; ++i) {
+    float t_i = logf(float(i + 2) / float(i + 1));
+    float b_i = logf(candidates->data[i].p / candidates->data[i + 1].p);
+    sum_ti_bi += t_i * b_i;
+    sum_ti_sq += t_i * t_i;
+  }
+  s_hat = sum_ti_bi / sum_ti_sq;
+
+  // Compute k from the estimated s_hat and target surprise value
+  float epsilon_hat = s_hat - 1;
+  float k = powf((epsilon_hat * powf(2, *mu)) / (1 - powf(N, -epsilon_hat)), 1 / s_hat);
+
+  // Sample the next word X using top-k sampling
+  llama_sample_top_k(nullptr, candidates, int(k), 1);
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+  llama_token X = llama_sample_token1(ctx, candidates);
+  t_start_sample_us = ggml_time_us();
+
+  // Compute error as the difference between observed surprise and target surprise value
+  size_t X_idx = std::distance(candidates->data,
+                               std::find_if(candidates->data, candidates->data + candidates->size,
+                                            [&](const llama_token_data& candidate) { return candidate.id == X; }));
+  float observed_surprise = -log2f(candidates->data[X_idx].p);
+  float e = observed_surprise - tau;
+
+  // Update mu using the learning rate and error
+  *mu = *mu - eta * e;
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+  return X;
+}
+
+llama_token llama_sample_token_mirostat_v2(struct llama_context* ctx, llama_token_data_array* candidates, float tau,
+                                           float eta, float* mu) {
+  int64_t t_start_sample_us;
+  t_start_sample_us = ggml_time_us();
+
+  llama_sample_softmax(ctx, candidates);
+
+  // Truncate the words with surprise values greater than mu
+  candidates->size = std::distance(
+      candidates->data, std::find_if(candidates->data, candidates->data + candidates->size,
+                                     [&](const llama_token_data& candidate) { return -log2f(candidate.p) > *mu; }));
+
+  if (candidates->size == 0) {
+    candidates->size = 1;
+  }
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+
+  // Normalize the probabilities of the remaining words
+  llama_sample_softmax(ctx, candidates);
+
+  // Sample the next word X from the remaining words
+  llama_token X = llama_sample_token1(ctx, candidates);
+  t_start_sample_us = ggml_time_us();
+
+  // Compute error as the difference between observed surprise and target surprise value
+  size_t X_idx = std::distance(candidates->data,
+                               std::find_if(candidates->data, candidates->data + candidates->size,
+                                            [&](const llama_token_data& candidate) { return candidate.id == X; }));
+  float observed_surprise = -log2f(candidates->data[X_idx].p);
+  float e = observed_surprise - tau;
+
+  // Update mu using the learning rate and error
+  *mu = *mu - eta * e;
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+  return X;
+}
+
+void llama_sample_top_k(struct llama_context* ctx, llama_token_data_array* candidates, int k, size_t min_keep) {
+  const int64_t t_start_sample_us = ggml_time_us();
+
+  k = std::max(k, (int)min_keep);
+  k = std::min(k, (int)candidates->size);
+
+  // Sort scores in descending order
+  if (!candidates->sorted) {
+    auto comp = [](const llama_token_data& a, const llama_token_data& b) { return a.logit > b.logit; };
+    if (k == (int)candidates->size) {
+      std::sort(candidates->data, candidates->data + candidates->size, comp);
+    } else {
+      std::partial_sort(candidates->data, candidates->data + k, candidates->data + candidates->size, comp);
+    }
+    candidates->sorted = true;
+  }
+  candidates->size = k;
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+}
+
+void llama_sample_top_p(struct llama_context* ctx, llama_token_data_array* candidates, float p, size_t min_keep) {
+  if (p >= 1.0f) {
+    return;
+  }
+
+  llama_sample_softmax(ctx, candidates);
+
+  const int64_t t_start_sample_us = ggml_time_us();
+
+  // Compute the cumulative probabilities
+  float cum_sum = 0.0f;
+  size_t last_idx = candidates->size;
+
+  for (size_t i = 0; i < candidates->size; ++i) {
+    cum_sum += candidates->data[i].p;
+
+    // Check if the running sum is at least p or if we have kept at least min_keep tokens
+    // we set the last index to i+1 to indicate that the current iterate should be included in the set
+    if (cum_sum >= p && i + 1 >= min_keep) {
+      last_idx = i + 1;
+      break;
+    }
+  }
+
+  // Resize the output vector to keep only the top-p tokens
+  candidates->size = last_idx;
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+}
+
+void llama_sample_tail_free(struct llama_context* ctx, llama_token_data_array* candidates, float z, size_t min_keep) {
+  if (z >= 1.0f || candidates->size <= 2) {
+    return;
+  }
+
+  llama_sample_softmax(nullptr, candidates);
+  const int64_t t_start_sample_us = ggml_time_us();
+
+  // Compute the first and second derivatives
+  std::vector<float> first_derivatives(candidates->size - 1);
+  std::vector<float> second_derivatives(candidates->size - 2);
+
+  for (size_t i = 0; i < first_derivatives.size(); ++i) {
+    first_derivatives[i] = candidates->data[i].p - candidates->data[i + 1].p;
+  }
+  for (size_t i = 0; i < second_derivatives.size(); ++i) {
+    second_derivatives[i] = first_derivatives[i] - first_derivatives[i + 1];
+  }
+
+  // Calculate absolute value of second derivatives
+  for (size_t i = 0; i < second_derivatives.size(); ++i) {
+    second_derivatives[i] = std::abs(second_derivatives[i]);
+  }
+
+  // Normalize the second derivatives
+  {
+    const float second_derivatives_sum = std::accumulate(second_derivatives.begin(), second_derivatives.end(), 0.0f);
+
+    if (second_derivatives_sum > 1e-6f) {
+      for (float& value : second_derivatives) {
+        value /= second_derivatives_sum;
+      }
+    } else {
+      for (float& value : second_derivatives) {
+        value = 1.0f / second_derivatives.size();
+      }
+    }
+  }
+
+  float cum_sum = 0.0f;
+  size_t last_idx = candidates->size;
+  for (size_t i = 0; i < second_derivatives.size(); ++i) {
+    cum_sum += second_derivatives[i];
+
+    // Check if the running sum is greater than z or if we have kept at least min_keep tokens
+    if (cum_sum > z && i >= min_keep) {
+      last_idx = i;
+      break;
+    }
+  }
+
+  // Resize the output vector to keep only the tokens above the tail location
+  candidates->size = last_idx;
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+}
+
+void llama_sample_typical(struct llama_context* ctx, llama_token_data_array* candidates, float p, size_t min_keep) {
+  // Reference implementation:
+  // https://github.com/huggingface/transformers/compare/main...cimeister:typical-sampling:typical-pr
+  if (p >= 1.0f) {
+    return;
+  }
+
+  // Compute the softmax of logits and calculate entropy
+  llama_sample_softmax(nullptr, candidates);
+
+  const int64_t t_start_sample_us = ggml_time_us();
+
+  float entropy = 0.0f;
+  for (size_t i = 0; i < candidates->size; ++i) {
+    entropy += -candidates->data[i].p * logf(candidates->data[i].p);
+  }
+
+  // Compute the absolute difference between negative log probability and entropy for each candidate
+  std::vector<float> shifted_scores;
+  for (size_t i = 0; i < candidates->size; ++i) {
+    float shifted_score = fabsf(-logf(candidates->data[i].p) - entropy);
+    shifted_scores.push_back(shifted_score);
+  }
+
+  // Sort tokens based on the shifted_scores and their corresponding indices
+  std::vector<size_t> indices(candidates->size);
+  std::iota(indices.begin(), indices.end(), 0);
+
+  std::sort(indices.begin(), indices.end(), [&](size_t a, size_t b) { return shifted_scores[a] < shifted_scores[b]; });
+
+  // Compute the cumulative probabilities
+  float cum_sum = 0.0f;
+  size_t last_idx = indices.size();
+
+  for (size_t i = 0; i < indices.size(); ++i) {
+    size_t idx = indices[i];
+    cum_sum += candidates->data[idx].p;
+
+    // Check if the running sum is greater than typical or if we have kept at least min_keep tokens
+    if (cum_sum > p && i >= min_keep - 1) {
+      last_idx = i + 1;
+      break;
+    }
+  }
+
+  // Resize the output vector to keep only the locally typical tokens
+  std::vector<llama_token_data> new_candidates;
+  for (size_t i = 0; i < last_idx; ++i) {
+    size_t idx = indices[i];
+    new_candidates.push_back(candidates->data[idx]);
+  }
+
+  // Replace the data in candidates with the new_candidates data
+  std::copy(new_candidates.begin(), new_candidates.end(), candidates->data);
+  candidates->size = new_candidates.size();
+
+  if (ctx) {
+    ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  }
+}
+
+llama_token llama_sample_token1(struct llama_context* ctx, llama_token_data_array* candidates) {
+  GGML_ASSERT(ctx);
+
+  const int64_t t_start_sample_us = ggml_time_us();
+  llama_sample_softmax(nullptr, candidates);
+
+  std::vector<float> probs;
+  probs.reserve(candidates->size);
+  for (size_t i = 0; i < candidates->size; ++i) {
+    probs.push_back(candidates->data[i].p);
+  }
+
+  std::discrete_distribution<> dist(probs.begin(), probs.end());
+  auto& rng = ctx->rng;
+  int idx = dist(rng);
+
+  llama_token result = candidates->data[idx].id;
+
+  ctx->t_sample_us += ggml_time_us() - t_start_sample_us;
+  ctx->n_sample++;
+  return result;
+}
+
+llama_token llama_sample_token2(struct llama_context* lctx, struct llama_context* ctx_guidance,
+                                struct llama_grammar* grammar, const struct gpt_params& params,
+                                const std::vector<llama_token>& last_tokens, std::vector<llama_token_data>& candidates,
+                                int idx) {
+  const int n_ctx = lctx->cparams.n_ctx;
+  const int n_vocab = llama_n_vocab(lctx->model);
+
+  const float temp = params.temp;
+  const int32_t top_k = params.top_k <= 0 ? n_vocab : params.top_k;
+  const float top_p = params.top_p;
+  const float tfs_z = params.tfs_z;
+  const float typical_p = params.typical_p;
+  const int32_t repeat_last_n = params.repeat_last_n < 0 ? n_ctx : params.repeat_last_n;
+  const float repeat_penalty = params.repeat_penalty;
+  const float alpha_presence = params.presence_penalty;
+  const float alpha_frequency = params.frequency_penalty;
+  const int mirostat = params.mirostat;
+  const float mirostat_tau = params.mirostat_tau;
+  const float mirostat_eta = params.mirostat_eta;
+  const bool penalize_nl = params.penalize_nl;
+
+  llama_token id = 0;
+
+  float* logits = llama_get_logits_ith(lctx, idx);
+
+  // Apply params.logit_bias map
+  for (auto it = params.logit_bias.begin(); it != params.logit_bias.end(); it++) {
+    logits[it->first] += it->second;
+  }
+
+  candidates.clear();
+  for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
+    candidates.emplace_back(llama_token_data{token_id, logits[token_id], 0.0f});
+  }
+
+  llama_token_data_array cur_p = {candidates.data(), candidates.size(), false};
+
+  // if (ctx_guidance) {
+  //   llama_sample_classifier_free_guidance(ctx, &cur_p, ctx_guidance, params.cfg_scale);
+  // }
+
+  // apply penalties
+  if (!last_tokens.empty()) {
+    const float nl_logit = logits[lctx->model->vocab.linefeed_id];
+    const int last_n_repeat = std::min(std::min((int)last_tokens.size(), repeat_last_n), n_ctx);
+
+    llama_sample_repetition_penalty(lctx, &cur_p, last_tokens.data() + last_tokens.size() - last_n_repeat,
+                                    last_n_repeat, repeat_penalty);
+    llama_sample_frequency_and_presence_penalties(lctx, &cur_p, last_tokens.data() + last_tokens.size() - last_n_repeat,
+                                                  last_n_repeat, alpha_frequency, alpha_presence);
+
+    if (!penalize_nl) {
+      for (size_t idx = 0; idx < cur_p.size; idx++) {
+        if (cur_p.data[idx].id == lctx->model->vocab.linefeed_id) {
+          cur_p.data[idx].logit = nl_logit;
+          break;
+        }
+      }
+    }
+  }
+
+  // if (grammar != NULL) {
+  //   llama_sample_grammar(lctx, &cur_p, grammar);
+  // }
+
+  if (temp <= 0) {
+    // Greedy sampling
+    id = llama_sample_token_greedy(lctx, &cur_p);
+  } else {
+    if (mirostat == 1) {
+      static float mirostat_mu = 2.0f * mirostat_tau;
+      const int mirostat_m = 100;
+      llama_sample_temp(lctx, &cur_p, temp);
+      id = llama_sample_token_mirostat(lctx, &cur_p, mirostat_tau, mirostat_eta, mirostat_m, &mirostat_mu);
+    } else if (mirostat == 2) {
+      static float mirostat_mu = 2.0f * mirostat_tau;
+      llama_sample_temp(lctx, &cur_p, temp);
+      id = llama_sample_token_mirostat_v2(lctx, &cur_p, mirostat_tau, mirostat_eta, &mirostat_mu);
+    } else {
+      // Temperature sampling
+      llama_sample_top_k(lctx, &cur_p, top_k, 1);
+      llama_sample_tail_free(lctx, &cur_p, tfs_z, 1);
+      llama_sample_typical(lctx, &cur_p, typical_p, 1);
+      llama_sample_top_p(lctx, &cur_p, top_p, 1);
+      llama_sample_temp(lctx, &cur_p, temp);
+
+      {
+        const int n_top = 10;
+        debug("top %d candidates:\n", n_top);
+
+        for (int i = 0; i < n_top; i++) {
+          const llama_token id = cur_p.data[i].id;
+          debug(" - %5d: '%12s' (%.3f)\n", id, llama_token_to_piece(lctx, id).c_str(), cur_p.data[i].p);
+        }
+      }
+
+      id = llama_sample_token1(lctx, &cur_p);
+
+      debug("sampled token: %5d: '%s'\n", id, llama_token_to_piece(lctx, id).c_str());
+    }
+  }
+  // printf("`%d`", candidates_p.size);
+
+  // if (grammar != NULL) {
+  //   llama_grammar_accept_token(lctx, grammar, id);
+  // }
+
+  return id;
+}
+
+struct llama_batch llama_batch_get_one(llama_token* tokens, int32_t n_tokens, llama_pos pos_0, llama_seq_id seq_id) {
+  return {
+      /*n_tokens    =*/n_tokens,
+      /*tokens      =*/tokens,
+      /*embd        =*/nullptr,
+      /*pos         =*/nullptr,
+      /*seq_id      =*/nullptr,
+      /*logits      =*/nullptr,
+      /*all_pos_0   =*/pos_0,
+      /*all_pos_1   =*/1,
+      /*all_seq_id  =*/seq_id,
+  };
+}
+
 // decode a batch of tokens by evaluating the transformer
 //
 //   - lctx:      llama context
@@ -11738,14 +13793,16 @@ int llama_decode(llama_context* lctx, llama_batch& batch) {
   ggml_cgraph* gf = llama_build_graph(lctx, batch);
 
   // Examine compute graph
-  printf("\nExamine compute graph\n");
-  for (size_t i = 0; i < gf->n_nodes; i++) {
-    const auto node = gf->nodes[i];
-    printf("Node: %-40s op: %s\n", node->name, GGML_OP_NAMES[node->op]);
-  }
-  for (size_t i = 0; i < gf->n_leafs; i++) {
-    const auto leaf = gf->leafs[i];
-    printf("Leaf: %-40s op: %s\n", leaf->name, GGML_OP_NAMES[leaf->op]);
+  if (is_debug_mode()) {
+    printf("\nExamine compute graph\n");
+    for (size_t i = 0; i < gf->n_nodes; i++) {
+      const auto node = gf->nodes[i];
+      printf("Node: %-40s op: %s\n", node->name, GGML_OP_NAMES[node->op]);
+    }
+    for (size_t i = 0; i < gf->n_leafs; i++) {
+      const auto leaf = gf->leafs[i];
+      printf("Leaf: %-40s op: %s\n", leaf->name, GGML_OP_NAMES[leaf->op]);
+    }
   }
 
   ggml_allocator_alloc_graph(lctx->allocator, gf);
@@ -11870,45 +13927,8 @@ int llama_decode(llama_context* lctx, llama_batch& batch) {
   return 0;
 }
 
-// =======================================================================
-// Global variables
-// =======================================================================
-llama_model* model = new llama_model();
-llama_ftype ftype;
-std::string model_arch_name;
-int64_t n_elements = 0;
-size_t n_bytes = 0;
-size_t n_tensors = 0;
-size_t n_created = 0;
-
-#define __MAIN_FUNCTION__
-// =======================================================================
-// Main
-// =======================================================================
-int main() {
-  init_type_traits();
-
+llama_model* llama_load_model(const char* model_file_path) {
   struct ggml_context* ctx_meta = NULL;
-
-  // Hard-coded params
-  const char* model_file_path = "models/llama-2-13b-chat.Q4_0.gguf";
-  const bool use_mmap = true;
-  const bool use_mlock = false;
-  const int n_gpu_layers = 0;
-  const size_t n_batch = 512;
-  const size_t n_threads = 1;
-  const size_t n_threads_batch = 1;
-  float* tensor_split = nullptr;
-
-  printf("%s: llama backend init\n", __func__);
-  bool numa = false;
-  llama_backend_init(numa);
-
-  int main_gpu = 0;
-  if (ggml_use_cublas()) {
-    LLAMA_LOG_INFO("%s: using CUDA for GPU acceleration\n", __func__);
-    ggml_cuda_set_main_device(main_gpu);
-  }
 
 #define P_BUILD_GGUF_CONTEXT
   FILE* file = nullptr;
@@ -12289,7 +14309,7 @@ int main() {
                 __func__, info->name.data, element_count, type_traits[info->type].blck_size);
         fclose(file);
         gguf_free(gguf_ctx);
-        return 1;
+        return NULL;
       }
 
       const size_t size_cur = (element_count * type_traits[info->type].type_size) / type_traits[info->type].blck_size;
@@ -12465,6 +14485,7 @@ int main() {
   printf("\n");
 
 #define P_BUILD_MODEL_OBJECT
+  llama_model* model = new llama_model();
   {
     // Model name
     {
@@ -13030,7 +15051,7 @@ int main() {
         const size_t tensor_offset = gguf_ctx->infos[i].offset;
         cur->data = (uint8_t*)mapping->addr + (data_offset + tensor_offset);
         std::string name = cur->name;
-        printf("%-40s: %p = %p + %ld\n", name.c_str(), cur->data, mapping->addr, (data_offset + tensor_offset));
+        debug("%-40s: %p = %p + %ld\n", name.c_str(), cur->data, mapping->addr, (data_offset + tensor_offset));
 
         switch (cur->backend) {
           case GGML_BACKEND_CPU:
@@ -13078,14 +15099,40 @@ int main() {
     }
   }
 
-#define P_WARM_UP_MODEL
-  {
-    LLAMA_LOG_INFO("Warming up the model with an empty run\n");
-    llama_context_params lparams = llama_context_default_params();
-    lparams.n_threads = 1;
-    lparams.n_threads_batch = 1;
-    llama_context* lctx = llama_new_context(model, lparams);
+  return model;
+}
 
+// =======================================================================
+// Global variables
+// =======================================================================
+llama_model* model = NULL;
+
+#define __MAIN_FUNCTION__
+// =======================================================================
+// Main
+// =======================================================================
+int main(int argc, char** argv) {
+#define P_INIT_BACKEND
+  printf("%s: llama backend init\n", __func__);
+  llama_backend_init(true);
+
+  int main_gpu = 0;
+  if (ggml_use_cublas()) {
+    LLAMA_LOG_INFO("%s: using CUDA for GPU acceleration\n", __func__);
+    ggml_cuda_set_main_device(main_gpu);
+  }
+
+#define P_LOAD_MODEL
+  model = llama_load_model(model_file_path);
+
+#define P_WARM_UP_MODEL
+  LLAMA_LOG_INFO("Warming up the model with an empty run\n");
+  llama_context_params lparams = llama_context_default_params();
+  lparams.n_threads = n_threads;
+  lparams.n_threads_batch = n_threads;
+  printf("%s: n_threads = %d\n", __func__, lparams.n_threads);
+  llama_context* lctx = llama_new_context(model, lparams);
+  {
     std::vector<llama_token> tmp = {
         model->vocab.special_bos_id,
         model->vocab.special_eos_id,
@@ -13105,5 +15152,137 @@ int main() {
     llama_decode(lctx, lbatch);
     llama_kv_cache_tokens_rm(lctx->kv_self, -1, -1);
     llama_reset_timings(lctx);
+  }
+
+#define P_GENERATE_ANSWER
+  {
+    llama_context* ctx_guidance = NULL;
+    struct llama_grammar* grammar = NULL;
+    gpt_params params;
+
+    if (!gpt_params_parse(argc, argv, params)) {
+      return 1;
+    }
+
+    const bool add_bos = llama_vocab_type(model) == LLAMA_VOCAB_TYPE_SPM;
+    printf("add_bos: %d\n", add_bos);
+
+    std::vector<llama_token> embd_inp;
+
+    printf("tokenize the prompt\n");
+    embd_inp = llama_tokenize(model, prompt, add_bos);
+    printf("prompt: \"%s\"\n", prompt);
+    printf("tokens: %s\n", log_tokens_tostr_pretty(lctx, embd_inp).c_str());
+
+    uint32_t n_ctx = lctx->cparams.n_ctx;
+    std::vector<llama_token> last_tokens(n_ctx);
+    std::fill(last_tokens.begin(), last_tokens.end(), 0);
+
+    bool is_antiprompt = false;
+    bool input_echo = true;
+    bool need_to_save_session = false;
+
+    int n_past = 0;
+    int n_remain = -1;
+    int n_consumed = 0;
+    int n_session_consumed = 0;
+    int n_past_guidance = 0;
+
+    std::vector<int> input_tokens;
+    g_input_tokens = &input_tokens;
+    std::vector<int> output_tokens;
+    g_output_tokens = &output_tokens;
+    std::ostringstream output_ss;
+    g_output_ss = &output_ss;
+
+    // the first thing we will do is to output the prompt, so set color accordingly
+    // console::set_display(console::prompt);
+
+    std::vector<llama_token> embd;
+    std::vector<llama_token> embd_guidance;
+
+    const int n_vocab = llama_n_vocab(model);
+
+    std::vector<llama_token_data> candidates;
+    candidates.reserve(n_vocab);
+
+    // Generate answer
+    while ((n_remain != 0 && !is_antiprompt) || is_interactive) {
+      if (!embd.empty()) {
+        // Note: n_ctx - 4 here is to match the logic for commandline prompt handling via
+        // --prompt or --file which uses the same value.
+        int max_embd_size = n_ctx - 4;
+
+        // evaluate tokens in batches
+        // embd is typically prepared beforehand to fit within a batch, but not always
+        for (int i = 0; i < (int)embd.size(); i += n_batch) {
+          int n_eval = (int)embd.size() - i;
+          if (n_eval > n_batch) {
+            n_eval = n_batch;
+          }
+
+          debug("eval: %s\n", log_tokens_tostr_pretty(lctx, embd));
+
+          llama_batch lbatch = llama_batch_get_one(&embd[i], n_eval, n_past, 0);
+          if (llama_decode(lctx, lbatch)) {
+            printf("%s : failed to eval\n", __func__);
+            return 1;
+          }
+
+          n_past += n_eval;
+
+          debug("n_past = %d\n", n_past);
+        }
+      }
+
+      embd.clear();
+
+      if ((int)embd_inp.size() <= n_consumed && !is_interactive) {
+        const llama_token id = llama_sample_token2(lctx, ctx_guidance, grammar, params, last_tokens, candidates);
+
+        last_tokens.erase(last_tokens.begin());
+        last_tokens.push_back(id);
+
+        debug("last: %s\n", log_tokens_tostr_pretty(lctx, last_tokens));
+
+        embd.push_back(id);
+
+        // echo this to console
+        input_echo = true;
+
+        // decrement remaining sampling budget
+        --n_remain;
+
+        debug("n_remain: %d\n", n_remain);
+      } else {
+        // some user input remains from prompt or interaction, forward it to processing
+        printf("embd_inp.size(): %d, n_consumed: %d\n", (int)embd_inp.size(), n_consumed);
+        while ((int)embd_inp.size() > n_consumed) {
+          embd.push_back(embd_inp[n_consumed]);
+          last_tokens.erase(last_tokens.begin());
+          last_tokens.push_back(embd_inp[n_consumed]);
+          ++n_consumed;
+          if ((int)embd.size() >= params.n_batch) {
+            break;
+          }
+        }
+      }
+
+      // Display text
+      if (input_echo) {
+        for (auto id : embd) {
+          const std::string token_str = llama_token_to_piece(lctx, id);
+          printf("%s", token_str.c_str());
+
+          if (embd.size() > 1) {
+            input_tokens.push_back(id);
+          } else {
+            output_tokens.push_back(id);
+            output_ss << token_str;
+          }
+        }
+        fflush(stdout);
+      }
+    }
   }
 }

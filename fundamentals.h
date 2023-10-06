@@ -248,19 +248,19 @@ void quantize_row_q5_K(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int 
 void quantize_row_q6_K(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
 void quantize_row_q8_K(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
 
-static void quantize_row_q4_0(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
-static void quantize_row_q4_1(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
-static void quantize_row_q5_0(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
-static void quantize_row_q5_1(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
-static void quantize_row_q8_0(const float* GGML_RESTRICT x, void* GGML_RESTRICT vy, int k);
-static void quantize_row_q8_1(const float* GGML_RESTRICT x, void* GGML_RESTRICT vy, int k);
+void quantize_row_q4_0(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
+void quantize_row_q4_1(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
+void quantize_row_q5_0(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
+void quantize_row_q5_1(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
+void quantize_row_q8_0(const float* GGML_RESTRICT x, void* GGML_RESTRICT vy, int k);
+void quantize_row_q8_1(const float* GGML_RESTRICT x, void* GGML_RESTRICT vy, int k);
 
-static void quantize_row_q4_0_reference(const float* GGML_RESTRICT x, block_q4_0* GGML_RESTRICT y, int k);
-static void quantize_row_q4_1_reference(const float* GGML_RESTRICT x, block_q4_1* GGML_RESTRICT y, int k);
-static void quantize_row_q5_0_reference(const float* GGML_RESTRICT x, block_q5_0* GGML_RESTRICT y, int k);
-static void quantize_row_q5_1_reference(const float* GGML_RESTRICT x, block_q5_1* GGML_RESTRICT y, int k);
-static void quantize_row_q8_0_reference(const float* GGML_RESTRICT x, block_q8_0* GGML_RESTRICT y, int k);
-static void quantize_row_q8_1_reference(const float* GGML_RESTRICT x, block_q8_1* GGML_RESTRICT y, int k);
+void quantize_row_q4_0_reference(const float* GGML_RESTRICT x, block_q4_0* GGML_RESTRICT y, int k);
+void quantize_row_q4_1_reference(const float* GGML_RESTRICT x, block_q4_1* GGML_RESTRICT y, int k);
+void quantize_row_q5_0_reference(const float* GGML_RESTRICT x, block_q5_0* GGML_RESTRICT y, int k);
+void quantize_row_q5_1_reference(const float* GGML_RESTRICT x, block_q5_1* GGML_RESTRICT y, int k);
+void quantize_row_q8_0_reference(const float* GGML_RESTRICT x, block_q8_0* GGML_RESTRICT y, int k);
+void quantize_row_q8_1_reference(const float* GGML_RESTRICT x, block_q8_1* GGML_RESTRICT y, int k);
 
 // Dequantization
 void dequantize_row_q2_K(const block_q2_K* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
@@ -270,11 +270,11 @@ void dequantize_row_q5_K(const block_q5_K* GGML_RESTRICT x, float* GGML_RESTRICT
 void dequantize_row_q6_K(const block_q6_K* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
 void dequantize_row_q8_K(const block_q8_K* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
 
-static void dequantize_row_q4_0(const block_q4_0* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
-static void dequantize_row_q4_1(const block_q4_1* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
-static void dequantize_row_q5_0(const block_q5_0* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
-static void dequantize_row_q5_1(const block_q5_1* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
-static void dequantize_row_q8_0(const void* GGML_RESTRICT vx, float* GGML_RESTRICT y, int k);
+void dequantize_row_q4_0(const block_q4_0* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
+void dequantize_row_q4_1(const block_q4_1* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
+void dequantize_row_q5_0(const block_q5_0* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
+void dequantize_row_q5_1(const block_q5_1* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
+void dequantize_row_q8_0(const void* GGML_RESTRICT vx, float* GGML_RESTRICT y, int k);
 
 // Dot product
 void ggml_vec_dot_q2_K_q8_K(int n, float* GGML_RESTRICT s, const void* GGML_RESTRICT vx, const void* GGML_RESTRICT vy);
@@ -302,22 +302,6 @@ void ggml_vec_dot_q5_1_q8_1(const int n, float* GGML_RESTRICT s, const void* GGM
                             const void* GGML_RESTRICT vy);
 void ggml_vec_dot_q8_0_q8_0(const int n, float* GGML_RESTRICT s, const void* GGML_RESTRICT vx,
                             const void* GGML_RESTRICT vy);
-
-void init_type_traits();
-
-typedef struct {
-  const char* type_name;
-  int blck_size;
-  size_t type_size;
-  bool is_quantized;
-  ggml_to_float_t to_float;
-  ggml_from_float_t from_float;
-  ggml_from_float_t from_float_reference;
-  ggml_vec_dot_t vec_dot;
-  enum ggml_type vec_dot_type;
-} ggml_type_traits_t;
-
-ggml_type_traits_t type_traits[GGML_TYPE_COUNT];
 
 // Fundamental ops
 float ggml_fp16_to_fp32(ggml_fp16_t x);

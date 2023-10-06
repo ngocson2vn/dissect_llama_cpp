@@ -32,6 +32,8 @@
 #define GGML_EXIT_SUCCESS 0
 #define GGML_EXIT_ABORTED 1
 
+#define DIRECTORY_SEPARATOR '/'
+
 #ifdef __cplusplus
 // GGML_RESTRICT not standard in C++
 #define GGML_RESTRICT
@@ -214,18 +216,6 @@ static const size_t MB = kB * kB;
 static const size_t GB = kB * kB * kB;
 // ========================================
 
-struct gguf_header {
-  uint32_t magic;
-  uint32_t version;
-  uint64_t n_tensors;  // GGUFv2
-  uint64_t n_kv;       // GGUFv2
-};
-
-struct gguf_str {
-  uint64_t n;  // GGUFv2
-  char* data;
-};
-
 enum gguf_type {
   GGUF_TYPE_UINT8 = 0,
   GGUF_TYPE_INT8 = 1,
@@ -241,6 +231,63 @@ enum gguf_type {
   GGUF_TYPE_INT64 = 11,
   GGUF_TYPE_FLOAT64 = 12,
   GGUF_TYPE_COUNT,  // marks the end of the enum
+};
+
+enum ggml_type {
+  GGML_TYPE_F32 = 0,
+  GGML_TYPE_F16 = 1,
+  GGML_TYPE_Q4_0 = 2,
+  GGML_TYPE_Q4_1 = 3,
+  // GGML_TYPE_Q4_2 = 4, support has been removed
+  // GGML_TYPE_Q4_3 (5) support has been removed
+  GGML_TYPE_Q5_0 = 6,
+  GGML_TYPE_Q5_1 = 7,
+  GGML_TYPE_Q8_0 = 8,
+  GGML_TYPE_Q8_1 = 9,
+  // k-quantizations
+  GGML_TYPE_Q2_K = 10,
+  GGML_TYPE_Q3_K = 11,
+  GGML_TYPE_Q4_K = 12,
+  GGML_TYPE_Q5_K = 13,
+  GGML_TYPE_Q6_K = 14,
+  GGML_TYPE_Q8_K = 15,
+  GGML_TYPE_I8,
+  GGML_TYPE_I16,
+  GGML_TYPE_I32,
+  GGML_TYPE_COUNT,
+};
+
+static const char* GGUF_TYPE_NAME[GGUF_TYPE_COUNT] = {
+    [GGUF_TYPE_UINT8] = "u8",    [GGUF_TYPE_INT8] = "i8",   [GGUF_TYPE_UINT16] = "u16",  [GGUF_TYPE_INT16] = "i16",
+    [GGUF_TYPE_UINT32] = "u32",  [GGUF_TYPE_INT32] = "i32", [GGUF_TYPE_FLOAT32] = "f32", [GGUF_TYPE_BOOL] = "bool",
+    [GGUF_TYPE_STRING] = "str",  [GGUF_TYPE_ARRAY] = "arr", [GGUF_TYPE_UINT64] = "u64",  [GGUF_TYPE_INT64] = "i64",
+    [GGUF_TYPE_FLOAT64] = "f64",
+};
+
+typedef struct {
+  const char* type_name;
+  int blck_size;
+  size_t type_size;
+  bool is_quantized;
+  ggml_to_float_t to_float;
+  ggml_from_float_t from_float;
+  ggml_from_float_t from_float_reference;
+  ggml_vec_dot_t vec_dot;
+  enum ggml_type vec_dot_type;
+} ggml_type_traits_t;
+
+static ggml_type_traits_t type_traits[GGML_TYPE_COUNT];
+
+struct gguf_header {
+  uint32_t magic;
+  uint32_t version;
+  uint64_t n_tensors;  // GGUFv2
+  uint64_t n_kv;       // GGUFv2
+};
+
+struct gguf_str {
+  uint64_t n;  // GGUFv2
+  char* data;
 };
 
 union gguf_value {
@@ -303,37 +350,6 @@ static const size_t GGUF_TYPE_SIZE[GGUF_TYPE_COUNT] = {
     [GGUF_TYPE_UINT64] = sizeof(uint64_t),
     [GGUF_TYPE_INT64] = sizeof(int64_t),
     [GGUF_TYPE_FLOAT64] = sizeof(double),
-};
-
-enum ggml_type {
-  GGML_TYPE_F32 = 0,
-  GGML_TYPE_F16 = 1,
-  GGML_TYPE_Q4_0 = 2,
-  GGML_TYPE_Q4_1 = 3,
-  // GGML_TYPE_Q4_2 = 4, support has been removed
-  // GGML_TYPE_Q4_3 (5) support has been removed
-  GGML_TYPE_Q5_0 = 6,
-  GGML_TYPE_Q5_1 = 7,
-  GGML_TYPE_Q8_0 = 8,
-  GGML_TYPE_Q8_1 = 9,
-  // k-quantizations
-  GGML_TYPE_Q2_K = 10,
-  GGML_TYPE_Q3_K = 11,
-  GGML_TYPE_Q4_K = 12,
-  GGML_TYPE_Q5_K = 13,
-  GGML_TYPE_Q6_K = 14,
-  GGML_TYPE_Q8_K = 15,
-  GGML_TYPE_I8,
-  GGML_TYPE_I16,
-  GGML_TYPE_I32,
-  GGML_TYPE_COUNT,
-};
-
-static const char* GGUF_TYPE_NAME[GGUF_TYPE_COUNT] = {
-    [GGUF_TYPE_UINT8] = "u8",    [GGUF_TYPE_INT8] = "i8",   [GGUF_TYPE_UINT16] = "u16",  [GGUF_TYPE_INT16] = "i16",
-    [GGUF_TYPE_UINT32] = "u32",  [GGUF_TYPE_INT32] = "i32", [GGUF_TYPE_FLOAT32] = "f32", [GGUF_TYPE_BOOL] = "bool",
-    [GGUF_TYPE_STRING] = "str",  [GGUF_TYPE_ARRAY] = "arr", [GGUF_TYPE_UINT64] = "u64",  [GGUF_TYPE_INT64] = "i64",
-    [GGUF_TYPE_FLOAT64] = "f64",
 };
 
 enum llm_kv {

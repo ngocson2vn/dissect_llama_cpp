@@ -125,13 +125,13 @@ Run GDB command with `-exec` option in VSCode `DEBUG CONSOLE`:
 # Reading Code
 # =====================================
 Code flow:
-![Code flow](./images/llama.cpp.flow.png)
+![Code flow](./docs/images/llama.cpp.flow.png)
 
 ## &#9312; GGUF Model
 Ref: [gguf.md](https://github.com/philpax/ggml/blob/gguf-spec/docs/gguf.md)  
 Copy: [gguf.md](./docs/gguf.md)
 
-## &#9313; Parse Model
+## &#9313; Load Model
 ### Understanding `posix_memalign`
 
 ### /data00/home/son.nguyen/workspace/llama.cpp/common/common.cpp:802
@@ -150,7 +150,7 @@ ctx_gguf = gguf_init_from_file(fname.c_str(), params);
 ```
 
 
-## &#9314; Process Model
+## &#9314; Build Computational Graph
 Replacements:
 ```
 ggml_type_size\(([->_A-Za-z0-9]+)\)
@@ -169,16 +169,6 @@ ggml_get_data\(([->_A-Za-z0-9]+)\)
 $1->data
 ```
 
-Compute nodes:  
-layer_inp_0: GGML_OP_GET_ROWS
-ggml_compute_forward_get_rows(params, tensor->src[0], tensor->src[1], tensor);
+## &#9315; Execute Computational Graph
 
-graph0  
-<img src="./docs/images/image.png" width="70%" height="70%" />
-
-inp_tokens: 0x7ffe2246c020
-
-
-## &#9315; Kernel Launch
-
-## &#9316; Kernel Code
+## &#9316; Kernel Launch
