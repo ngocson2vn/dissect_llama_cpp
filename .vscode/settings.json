@@ -73,5 +73,10 @@
     "valarray": "cpp",
     "bit": "cpp"
   },
-  "memory-view.showMemoryPanel": true
+  "memory-view.showMemoryPanel": true,
+  "C_Cpp.clang_format_fallbackStyle": "{ BasedOnStyle: Google, IndentWidth: 2, TabWidth: 2, ColumnLimit: 120, DerivePointerAlignment: false, PointerAlignment: Left }",
+  "pasteImage.path": "${projectRoot}/docs/images",
+  "pasteImage.basePath": "${projectRoot}/docs",
+  "pasteImage.forceUnixStyleSeparator": true,
+  "pasteImage.prefix": "/"
 }

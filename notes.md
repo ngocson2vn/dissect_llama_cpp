@@ -6,6 +6,25 @@ Read code linearly part by part. Determine!
 Go to the edge of it.
 
 # =====================================
+# Machine Learning
+# =====================================
+## In machine learning, what does logits mean?
+In machine learning, the term "logits" refers to the raw, unnormalized output scores produced by a classification model before they are transformed into probabilities through a softmax function. Logits are typically used in the context of multi-class classification problems.
+
+Here's how the process generally works:
+
+1. The model makes predictions for each class or category in a classification problem.  
+2. These predictions are represented as logits, which are typically real numbers and can be positive, negative, or zero.  
+3. To convert logits into probabilities, a softmax function is applied to the logits. The softmax function exponentiates the logits and then normalizes them, ensuring that the resulting values sum to 1. This transformation makes it easier to interpret the model's output as probabilities.  
+The softmax function is defined as follows for class j:
+
+P(class j) = exp(logits_j) / sum(exp(logits_i) for all classes i)
+
+The class with the highest probability after the softmax transformation is typically considered the model's predicted class.
+
+In summary, logits are the intermediate values in a classification model that represent the unnormalized scores for each class before they are turned into probabilities for making a final prediction.
+
+# =====================================
 # CUDA
 # =====================================
 ## NVCC Options for Separate Compilation
@@ -61,7 +80,7 @@ make
 ## Build Notes
 ```bash
 # ggml-cuda.o
-/usr/local/cuda/bin/nvcc --forward-unknown-to-host-compiler -use_fast_math -Wno-deprecated-gpu-targets -arch=compute_75 -DGGML_CUDA_DMMV_X=32 -DGGML_CUDA_MMV_Y=1 -DK_QUANTS_PER_ITERATION=2 -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128 -I. -Icommon -D_XOPEN_SOURCE=600 -D_GNU_SOURCE -DNDEBUG -DGGML_USE_K_QUANTS -DGGML_USE_CUBLAS -I/usr/local/cuda/include -I/opt/cuda/include -I/targets/x86_64-linux/include  -std=c++11 -fPIC -O3 -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wmissing-declarations -Wmissing-noreturn -pthread    -Wno-pedantic -Xcompiler "-Wno-array-bounds -Wno-format-truncation -Wextra-semi -march=native -mtune=native " -c ggml-cuda.cu -o ggml-cuda.o
+/usr/local/cuda/bin/nvcc --forward-unknown-to-host-compiler -use_fast_math -Wno-deprecated-gpu-targets -arch=compute_75 -DGGML_CUDA_DMMV_X=32 -DGGML_CUDA_MMV_Y=1 -DK_QUANTS_PER_ITERATION=2 -DGGML_CUDA_PEER_MAX_BATCH_SIZE=128 -I. -Icommon -D_XOPEN_SOURCE=600 -D_GNU_SOURCE -DNDEBUG -DGGML_USE_K_QUANTS -DGGML_USE_CUBLAS -I/usr/local/cuda/include -I/opt/cuda/include -I/targets/x86_64-linux/include  -std=c++11 -fPIC -O3 -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wmissing-declarations -Wmissing-noreturn -pthread -Wno-pedantic -Xcompiler -Wno-array-bounds -Wno-format-truncation -Wextra-semi -march=native -mtune=native -c ggml-cuda.cu -o ggml-cuda.o
 
 # main
 g++ -I. -Icommon -D_XOPEN_SOURCE=600 -D_GNU_SOURCE -DNDEBUG -DGGML_USE_K_QUANTS -DGGML_USE_CUBLAS -I/usr/local/cuda/include -I/opt/cuda/include -I/targets/x86_64-linux/include  -std=c++11 -fPIC -O3 -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wmissing-declarations -Wmissing-noreturn -pthread  -Wno-array-bounds -Wno-format-truncation -Wextra-semi -march=native -mtune=native  examples/main/main.cpp ggml.o llama.o common.o console.o grammar-parser.o k_quants.o ggml-cuda.o ggml-alloc.o -o main -lcublas -lculibos -lcudart -lcublasLt -lpthread -ldl -lrt -L/usr/local/cuda/lib64 -L/opt/cuda/lib64 -L/targets/x86_64-linux/lib
@@ -132,6 +151,33 @@ ctx_gguf = gguf_init_from_file(fname.c_str(), params);
 
 
 ## &#9314; Process Model
+Replacements:
+```
+ggml_type_size\(([->_A-Za-z0-9]+)\)
+type_traits[$1].type_size
+
+ggml_element_size\(([->_A-Za-z0-9]+)\)
+type_traits[$1->type].type_size
+
+ggml_blck_size\(([->_A-Za-z0-9]+)\)
+type_traits[$1].blck_size
+
+ggml_is_quantized\(([->_A-Za-z0-9]+)\)
+type_traits[$1].is_quantized
+
+ggml_get_data\(([->_A-Za-z0-9]+)\)
+$1->data
+```
+
+Compute nodes:  
+layer_inp_0: GGML_OP_GET_ROWS
+ggml_compute_forward_get_rows(params, tensor->src[0], tensor->src[1], tensor);
+
+graph0  
+<img src="./docs/images/image.png" width="70%" height="70%" />
+
+inp_tokens: 0x7ffe2246c020
+
 
 ## &#9315; Kernel Launch
 

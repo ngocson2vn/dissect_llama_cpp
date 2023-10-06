@@ -3,11 +3,13 @@
 #include <assert.h>
 #include <float.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 // =======================================================================
 // Defines
@@ -18,18 +20,49 @@
 #define GGML_SOFT_MAX_UNROLL 4
 #define GGML_VEC_DOT_UNROLL 2
 #define GGML_VEC_MAD_UNROLL 32
+#define GGML_MAX_NODES 16384
 #define GGML_MAX_OP_PARAMS 32
 #define GGML_MAX_SRC 6
 #define GGML_MAX_NAME 64
 #define GGML_NUMA_MAX_NODES 8
 #define GGML_NUMA_MAX_CPUS 512
 #define GGML_MAX_CONTEXTS 64
+#define GGML_DEFAULT_N_THREADS 4
+#define GGML_N_TASKS_MAX -1
+#define GGML_EXIT_SUCCESS 0
+#define GGML_EXIT_ABORTED 1
 
 #ifdef __cplusplus
 // GGML_RESTRICT not standard in C++
 #define GGML_RESTRICT
 #else
 #define GGML_RESTRICT restrict
+#endif
+
+#ifdef GGML_SHARED
+#define GGML_API __attribute__((visibility("default")))
+#else
+#define GGML_API
+#endif
+
+#ifdef GGML_USE_CUBLAS
+#define GGML_CUDA_NAME "CUDA"
+#define GGML_CUBLAS_NAME "cuBLAS"
+#define LLAMA_BACKEND_OFFLOAD GGML_BACKEND_GPU
+#define LLAMA_BACKEND_OFFLOAD_SPLIT GGML_BACKEND_GPU_SPLIT
+#else
+#define LLAMA_BACKEND_OFFLOAD GGML_BACKEND_CPU
+#define LLAMA_BACKEND_OFFLOAD_SPLIT GGML_BACKEND_CPU
+#endif
+
+#if defined(__cpp_lib_hardware_interference_size)
+#define CACHE_LINE_SIZE hardware_destructive_interference_size
+#else
+#if defined(__POWER9_VECTOR__)
+#define CACHE_LINE_SIZE 128
+#else
+#define CACHE_LINE_SIZE 64
+#endif
 #endif
 
 // =======================================================================
@@ -49,6 +82,7 @@
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 
 #define GGML_PAD(x, n) (((x) + (n)-1) & ~((n)-1))
+#define GGML_UNUSED(x) (void)(x)
 
 //
 // logging
@@ -74,6 +108,59 @@
 
 #define GGML_PRINT(...) printf(__VA_ARGS__)
 
+// used to copy the number of elements and stride in bytes of tensors into local variables.
+// main purpose is to reduce code duplication and improve readability.
+//
+// example:
+//
+//    GGML_TENSOR_LOCALS(int64_t, ne1, src1, ne);
+//    GGML_TENSOR_LOCALS(size_t,  nb1, src1, nb);
+//
+#define GGML_TENSOR_LOCALS_1(type, prefix, pointer, array) \
+  const type prefix##0 = (pointer)->array[0];              \
+  GGML_UNUSED(prefix##0);
+#define GGML_TENSOR_LOCALS_2(type, prefix, pointer, array) \
+  GGML_TENSOR_LOCALS_1(type, prefix, pointer, array)       \
+  const type prefix##1 = (pointer)->array[1];              \
+  GGML_UNUSED(prefix##1);
+#define GGML_TENSOR_LOCALS_3(type, prefix, pointer, array) \
+  GGML_TENSOR_LOCALS_2(type, prefix, pointer, array)       \
+  const type prefix##2 = (pointer)->array[2];              \
+  GGML_UNUSED(prefix##2);
+#define GGML_TENSOR_LOCALS(type, prefix, pointer, array) \
+  GGML_TENSOR_LOCALS_3(type, prefix, pointer, array)     \
+  const type prefix##3 = (pointer)->array[3];            \
+  GGML_UNUSED(prefix##3);
+
+#define GGML_TENSOR_UNARY_OP_LOCALS          \
+  GGML_TENSOR_LOCALS(int64_t, ne0, src0, ne) \
+  GGML_TENSOR_LOCALS(size_t, nb0, src0, nb)  \
+  GGML_TENSOR_LOCALS(int64_t, ne, dst, ne)   \
+  GGML_TENSOR_LOCALS(size_t, nb, dst, nb)
+
+#define GGML_TENSOR_BINARY_OP_LOCALS         \
+  GGML_TENSOR_LOCALS(int64_t, ne0, src0, ne) \
+  GGML_TENSOR_LOCALS(size_t, nb0, src0, nb)  \
+  GGML_TENSOR_LOCALS(int64_t, ne1, src1, ne) \
+  GGML_TENSOR_LOCALS(size_t, nb1, src1, nb)  \
+  GGML_TENSOR_LOCALS(int64_t, ne, dst, ne)   \
+  GGML_TENSOR_LOCALS(size_t, nb, dst, nb)
+
+#ifdef GGML_PERF
+#define ggml_perf_time_ms() ggml_time_ms()
+#define ggml_perf_time_us() ggml_time_us()
+#define ggml_perf_cycles() ggml_cycles()
+#define ggml_perf_cycles_per_ms() ggml_cycles_per_ms()
+#else
+#define ggml_perf_time_ms() 0
+#define ggml_perf_time_us() 0
+#define ggml_perf_cycles() 0
+#define ggml_perf_cycles_per_ms() 0
+#endif
+
+#define ggml_thread_create pthread_create
+#define ggml_thread_join pthread_join
+
 // =======================================================================
 // Typedefs
 // =======================================================================
@@ -88,6 +175,9 @@ typedef uint16_t ggml_fp16_t;
 // floating point type used to accumulate sums
 typedef double ggml_float;
 
+typedef pthread_t ggml_thread_t;
+typedef void* thread_ret_t;
+
 typedef void (*ggml_to_float_t)(const void* GGML_RESTRICT x, float* GGML_RESTRICT y, int k);
 typedef void (*ggml_from_float_t)(const float* GGML_RESTRICT x, void* GGML_RESTRICT y, int k);
 typedef void (*ggml_vec_dot_t)(const int n, float* GGML_RESTRICT s, const void* GGML_RESTRICT x,
@@ -100,9 +190,29 @@ typedef void (*ggml_log_callback)(enum ggml_log_level level, const char* text, v
 // =======================================================================
 // Data Structures
 // =======================================================================
+// ========================================
+// Global data
+// ========================================
+
+// Precomputed gelu table for f16 (128 KB)
+ggml_fp16_t table_gelu_f16[1 << 16];
+
+// Precomputed quick gelu table for f16 (128 KB)
+ggml_fp16_t table_gelu_quick_f16[1 << 16];
+
+// Precomputed silu table for f16 (128 KB)
+ggml_fp16_t table_silu_f16[1 << 16];
+
+// Precomputed exp table for f16 (128 KB)
+ggml_fp16_t table_exp_f16[1 << 16];
+
+// Precomputed f32 table for f16 (256 KB)
+float table_f32_f16[1 << 16];
+
 static const size_t kB = 1024;
 static const size_t MB = kB * kB;
 static const size_t GB = kB * kB * kB;
+// ========================================
 
 struct gguf_header {
   uint32_t magic;
@@ -270,50 +380,6 @@ enum llm_kv {
   LLM_KV_TOKENIZER_RWKV,
 };
 
-static std::map<llm_kv, std::string> LLM_KV_NAMES = {
-    {LLM_KV_GENERAL_ARCHITECTURE, "general.architecture"},
-    {LLM_KV_GENERAL_QUANTIZATION_VERSION, "general.quantization_version"},
-    {LLM_KV_GENERAL_ALIGNMENT, "general.alignment"},
-    {LLM_KV_GENERAL_NAME, "general.name"},
-    {LLM_KV_GENERAL_AUTHOR, "general.author"},
-    {LLM_KV_GENERAL_URL, "general.url"},
-    {LLM_KV_GENERAL_DESCRIPTION, "general.description"},
-    {LLM_KV_GENERAL_LICENSE, "general.license"},
-    {LLM_KV_GENERAL_SOURCE_URL, "general.source.url"},
-    {LLM_KV_GENERAL_SOURCE_HF_REPO, "general.source.huggingface.repository"},
-
-    {LLM_KV_CONTEXT_LENGTH, "%s.context_length"},
-    {LLM_KV_EMBEDDING_LENGTH, "%s.embedding_length"},
-    {LLM_KV_BLOCK_COUNT, "%s.block_count"},
-    {LLM_KV_FEED_FORWARD_LENGTH, "%s.feed_forward_length"},
-    {LLM_KV_USE_PARALLEL_RESIDUAL, "%s.use_parallel_residual"},
-    {LLM_KV_TENSOR_DATA_LAYOUT, "%s.tensor_data_layout"},
-
-    {LLM_KV_ATTENTION_HEAD_COUNT, "%s.attention.head_count"},
-    {LLM_KV_ATTENTION_HEAD_COUNT_KV, "%s.attention.head_count_kv"},
-    {LLM_KV_ATTENTION_MAX_ALIBI_BIAS, "%s.attention.max_alibi_bias"},
-    {LLM_KV_ATTENTION_CLAMP_KQV, "%s.attention.clamp_kqv"},
-    {LLM_KV_ATTENTION_LAYERNORM_EPS, "%s.attention.layer_norm_epsilon"},
-    {LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, "%s.attention.layer_norm_rms_epsilon"},
-
-    {LLM_KV_ROPE_DIMENSION_COUNT, "%s.rope.dimension_count"},
-    {LLM_KV_ROPE_FREQ_BASE, "%s.rope.freq_base"},
-    {LLM_KV_ROPE_SCALE_LINEAR, "%s.rope.scale_linear"},
-
-    {LLM_KV_TOKENIZER_MODEL, "tokenizer.ggml.model"},
-    {LLM_KV_TOKENIZER_LIST, "tokenizer.ggml.tokens"},
-    {LLM_KV_TOKENIZER_TOKEN_TYPE, "tokenizer.ggml.token_type"},
-    {LLM_KV_TOKENIZER_SCORES, "tokenizer.ggml.scores"},
-    {LLM_KV_TOKENIZER_MERGES, "tokenizer.ggml.merges"},
-    {LLM_KV_TOKENIZER_BOS_ID, "tokenizer.ggml.bos_token_id"},
-    {LLM_KV_TOKENIZER_EOS_ID, "tokenizer.ggml.eos_token_id"},
-    {LLM_KV_TOKENIZER_UNK_ID, "tokenizer.ggml.unknown_token_id"},
-    {LLM_KV_TOKENIZER_SEP_ID, "tokenizer.ggml.seperator_token_id"},
-    {LLM_KV_TOKENIZER_PAD_ID, "tokenizer.ggml.padding_token_id"},
-    {LLM_KV_TOKENIZER_HF_JSON, "tokenizer.huggingface.json"},
-    {LLM_KV_TOKENIZER_RWKV, "tokenizer.rwkv.world"},
-};
-
 enum llm_arch {
   LLM_ARCH_LLAMA,
   LLM_ARCH_FALCON,
@@ -324,12 +390,6 @@ enum llm_arch {
   LLM_ARCH_MPT,
   LLM_ARCH_STARCODER,
   LLM_ARCH_UNKNOWN,
-};
-
-static std::map<std::string, llm_arch> LLM_ARCH_NAMES = {
-    {"llama", LLM_ARCH_LLAMA},       {"falcon", LLM_ARCH_FALCON},       {"gpt2", LLM_ARCH_GPT2},
-    {"gptj", LLM_ARCH_GPTJ},         {"gptneox", LLM_ARCH_GPTNEOX},     {"mpt", LLM_ARCH_MPT},
-    {"baichuan", LLM_ARCH_BAICHUAN}, {"starcoder", LLM_ARCH_STARCODER},
 };
 
 struct gguf_tensor_info {
@@ -352,6 +412,25 @@ struct gguf_init_params {
 
   // if not NULL, create a ggml_context and allocate the tensor data in it
   struct ggml_context** ctx;
+};
+
+// NOTE: the INIT or FINALIZE pass is not scheduled unless explicitly enabled.
+// This behavior was changed since https://github.com/ggerganov/llama.cpp/pull/1995.
+enum ggml_task_type {
+  GGML_TASK_INIT = 0,
+  GGML_TASK_COMPUTE,
+  GGML_TASK_FINALIZE,
+};
+
+struct ggml_compute_params {
+  enum ggml_task_type type;
+
+  // ith = thread index, nth = number of threads
+  int ith, nth;
+
+  // work buffer for all threads
+  size_t wsize;
+  void* wdata;
 };
 
 enum ggml_object_type { GGML_OBJECT_TENSOR, GGML_OBJECT_GRAPH, GGML_OBJECT_WORK_BUFFER };
@@ -460,6 +539,86 @@ enum ggml_op {
   GGML_OP_COUNT,
 };
 
+static const char* GGML_OP_NAMES[GGML_OP_COUNT] = {
+    "NONE",
+
+    "DUP",
+    "ADD",
+    "ADD1",
+    "ACC",
+    "SUB",
+    "MUL",
+    "DIV",
+    "SQR",
+    "SQRT",
+    "LOG",
+    "SUM",
+    "SUM_ROWS",
+    "MEAN",
+    "ARGMAX",
+    "REPEAT",
+    "REPEAT_BACK",
+    "CONCAT",
+    "SILU_BACK",
+    "NORM",
+    "RMS_NORM",
+    "RMS_NORM_BACK",
+    "GROUP_NORM",
+
+    "MUL_MAT",
+    "OUT_PROD",
+
+    "SCALE",
+    "SET",
+    "CPY",
+    "CONT",
+    "RESHAPE",
+    "VIEW",
+    "PERMUTE",
+    "TRANSPOSE",
+    "GET_ROWS",
+    "GET_ROWS_BACK",
+    "DIAG",
+    "DIAG_MASK_INF",
+    "DIAG_MASK_ZERO",
+    "SOFT_MAX",
+    "SOFT_MAX_BACK",
+    "ROPE",
+    "ROPE_BACK",
+    "ALIBI",
+    "CLAMP",
+    "CONV_1D",
+    "CONV_2D",
+    "CONV_TRANSPOSE_2D",
+    "POOL_1D",
+    "POOL_2D",
+    "UPSCALE",
+
+    "FLASH_ATTN",
+    "FLASH_FF",
+    "FLASH_ATTN_BACK",
+    "WIN_PART",
+    "WIN_UNPART",
+    "GET_REL_POS",
+    "ADD_REL_POS",
+
+    "UNARY",
+
+    "MAP_UNARY",
+    "MAP_BINARY",
+
+    "MAP_CUSTOM1_F32",
+    "MAP_CUSTOM2_F32",
+    "MAP_CUSTOM3_F32",
+
+    "MAP_CUSTOM1",
+    "MAP_CUSTOM2",
+    "MAP_CUSTOM3",
+
+    "CROSS_ENTROPY_LOSS",
+    "CROSS_ENTROPY_LOSS_BACK",
+};
+
 // n-dimensional tensor
 struct ggml_tensor {
   enum ggml_type type;
@@ -564,3 +723,137 @@ struct ggml_state {
 // Take care about compile options (e.g., GGML_USE_xxx).
 static bool GGML_OP_HAS_INIT[GGML_OP_COUNT] = {0};
 static bool GGML_OP_HAS_FINALIZE[GGML_OP_COUNT] = {0};
+
+#define __GGML_ALLOCATOR__
+struct free_block {
+  void* addr;
+  size_t size;
+};
+
+struct hash_node {
+  struct ggml_tensor* t;
+  int n_children;
+  int n_views;
+};
+
+#define MAX_FREE_BLOCKS 256
+
+// next prime after GGML_MAX_NODES
+// #define GGML_GRAPH_HASHTABLE_SIZE 4099
+// next prime after GGML_MAX_NODES * 2 (nodes + leafs)
+// #define GGML_GRAPH_HASHTABLE_SIZE 8273
+// #define GGML_GRAPH_HASHTABLE_SIZE 16411
+#define GGML_GRAPH_HASHTABLE_SIZE 32771
+
+#define GGML_MAX_CONCUR (2 * GGML_MAX_NODES)
+
+struct ggml_allocator {
+  void* data;
+  size_t size;
+  size_t alignment;
+  int n_free_blocks;
+  struct free_block free_blocks[MAX_FREE_BLOCKS];
+  struct hash_node hash_table[GGML_GRAPH_HASHTABLE_SIZE];
+  size_t max_size;
+  bool measure;
+  int parse_seq[GGML_MAX_CONCUR];
+  int parse_seq_len;
+};
+
+enum ggml_cgraph_eval_order {
+  GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT = 0,
+  GGML_CGRAPH_EVAL_ORDER_RIGHT_TO_LEFT,
+  GGML_CGRAPH_EVAL_ORDER_COUNT
+};
+
+// computation graph
+struct ggml_cgraph {
+  int n_nodes;
+  int n_leafs;
+
+  struct ggml_tensor* nodes[GGML_MAX_NODES];
+  struct ggml_tensor* grads[GGML_MAX_NODES];
+  struct ggml_tensor* leafs[GGML_MAX_NODES];
+
+  void* visited_hash_table[GGML_GRAPH_HASHTABLE_SIZE];
+
+  enum ggml_cgraph_eval_order order;
+
+  // performance
+  int perf_runs;
+  int64_t perf_cycles;
+  int64_t perf_time_us;
+};
+
+static const size_t GGML_GRAPH_SIZE = sizeof(struct ggml_cgraph);
+
+typedef void (*offload_func_t)(struct ggml_tensor* tensor);
+
+enum ggml_unary_op {
+  GGML_UNARY_OP_ABS,
+  GGML_UNARY_OP_SGN,
+  GGML_UNARY_OP_NEG,
+  GGML_UNARY_OP_STEP,
+  GGML_UNARY_OP_TANH,
+  GGML_UNARY_OP_ELU,
+  GGML_UNARY_OP_RELU,
+  GGML_UNARY_OP_GELU,
+  GGML_UNARY_OP_GELU_QUICK,
+  GGML_UNARY_OP_SILU,
+};
+
+// the compute plan that needs to be prepared for ggml_graph_compute()
+// since https://github.com/ggerganov/ggml/issues/287
+struct ggml_cplan {
+  size_t work_size;    // size of work buffer, calculated by `ggml_graph_plan()`
+  uint8_t* work_data;  // work buffer, to be allocated by caller before calling to `ggml_graph_compute()`
+
+  int n_threads;
+
+  // the `n_tasks` of nodes, 1:1 mapping to cgraph nodes
+  int n_tasks[GGML_MAX_NODES];
+
+  // abort ggml_graph_compute when true
+  bool (*abort_callback)(void* data);
+  void* abort_callback_data;
+};
+
+typedef void (*ggml_custom1_op_t)(struct ggml_tensor* dst, const struct ggml_tensor* a, int ith, int nth,
+                                  void* userdata);
+typedef void (*ggml_custom2_op_t)(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
+                                  int ith, int nth, void* userdata);
+typedef void (*ggml_custom3_op_t)(struct ggml_tensor* dst, const struct ggml_tensor* a, const struct ggml_tensor* b,
+                                  const struct ggml_tensor* c, int ith, int nth, void* userdata);
+typedef void (*ggml_unary_op_f32_t)(const int, float*, const float*);
+typedef void (*ggml_binary_op_f32_t)(const int, float*, const float*, const float*);
+typedef void (*ggml_custom1_op_f32_t)(struct ggml_tensor*, const struct ggml_tensor*);
+typedef void (*ggml_custom2_op_f32_t)(struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*);
+typedef void (*ggml_custom3_op_f32_t)(struct ggml_tensor*, const struct ggml_tensor*, const struct ggml_tensor*,
+                                      const struct ggml_tensor*);
+
+// ggml_map_custom1
+struct ggml_map_custom1_op_params {
+  ggml_custom1_op_t fun;
+  int n_tasks;
+  void* userdata;
+};
+
+struct ggml_map_custom2_op_params {
+  ggml_custom2_op_t fun;
+  int n_tasks;
+  void* userdata;
+};
+
+struct ggml_map_custom3_op_params {
+  ggml_custom3_op_t fun;
+  int n_tasks;
+  void* userdata;
+};
+
+static const size_t CACHE_LINE_SIZE_F32 = CACHE_LINE_SIZE / sizeof(float);
+
+enum ggml_op_pool {
+  GGML_OP_POOL_MAX,
+  GGML_OP_POOL_AVG,
+  GGML_OP_POOL_COUNT,
+};
